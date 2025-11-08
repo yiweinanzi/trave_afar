@@ -1,0 +1,53 @@
+# 模型文件（太大，不上传）
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# 数据文件（可选择性上传部分）
+outputs/emb/*.npy
+outputs/cache/
+outputs/recbole/saved/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+outputs/embedding_log.txt
+
+# 大文件
+*.zip
+open_resource/*.zip
+
+# 开源参考代码（太大，不上传）
+open_resource/
+WebAIBackend-master/
+
+# 临时文件
+*.txt
+!requirements.txt
+项目*.txt
+🎊*.txt
