@@ -27,13 +27,20 @@ class QwenRecommender:
         
         # 检查本地是否有模型
         import os
-        local_model_path = f"/root/autodl-tmp/goafar_project/models/{model_name_or_path.split('/')[-1]}"
+        # 优先检查HuggingFace缓存格式的路径
+        local_model_path = "/root/autodl-tmp/goafar_project/models/models--Qwen--Qwen3-8B"
         
         if os.path.exists(local_model_path):
             print(f"  使用本地模型: {local_model_path}")
             model_path = local_model_path
         else:
-            model_path = model_name_or_path
+            # 回退到原始路径格式
+            fallback_path = f"/root/autodl-tmp/goafar_project/models/{model_name_or_path.split('/')[-1]}"
+            if os.path.exists(fallback_path):
+                print(f"  使用本地模型: {fallback_path}")
+                model_path = fallback_path
+            else:
+                model_path = model_name_or_path
         
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(

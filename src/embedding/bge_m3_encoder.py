@@ -134,8 +134,25 @@ class BGEM3Encoder:
         
         elif method == 'colbert':
             # ColBERT: 多向量交互
-            # TODO: 实现ColBERT相似度计算
-            raise NotImplementedError("ColBERT相似度计算待实现")
+            # query_vecs: (seq_len, dim)
+            # corpus_vecs: (n_docs, seq_len, dim)
+            query_vecs = query_embedding['colbert_vecs']
+            corpus_vecs = corpus_embeddings['colbert_vecs']
+            
+            # ColBERT相似度：max pooling over query tokens
+            # score = max_i sum_j max(query_vecs[i] @ corpus_vecs[j])
+            scores = []
+            for doc_vecs in corpus_vecs:
+                # 计算每个query token与doc的最大相似度
+                max_sims = []
+                for q_vec in query_vecs:
+                    # q_vec: (dim,), doc_vecs: (seq_len, dim)
+                    sims = q_vec @ doc_vecs.T  # (seq_len,)
+                    max_sims.append(sims.max().item())
+                # 对所有query token的最大相似度求和
+                scores.append(sum(max_sims))
+            
+            return np.array(scores)
         
         else:
             raise ValueError(f"不支持的方法: {method}")

@@ -161,8 +161,62 @@ class LLMReranker:
         """调用LLM"""
         if self.llm_model is None:
             raise ValueError("LLM模型未初始化")
-        # TODO: 实现具体调用
-        raise NotImplementedError()
+        
+        # 复用llm_generator中的LLM调用逻辑
+        try:
+            # 如果llm_model是LLMGenerator实例
+            if hasattr(self.llm_model, 'tokenizer') and hasattr(self.llm_model, 'model'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游推荐助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                text = self.llm_model.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                
+                model_inputs = self.llm_model.tokenizer([text], return_tensors="pt").to(self.llm_model.model.device)
+                
+                generated_ids = self.llm_model.model.generate(
+                    **model_inputs,
+                    max_new_tokens=300,
+                    temperature=0.3,
+                    do_sample=True
+                )
+                
+                generated_ids = [
+                    output_ids[len(input_ids):] 
+                    for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+                ]
+                
+                response = self.llm_model.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                return response.strip()
+            
+            # 如果llm_model有generate方法
+            elif hasattr(self.llm_model, 'generate'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游推荐助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                response = self.llm_model.generate(messages)
+                return response
+            
+            # 如果llm_model有chat方法（API调用）
+            elif hasattr(self.llm_model, 'chat'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游推荐助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                response = self.llm_model.chat(messages)
+                return response
+            
+            else:
+                raise ValueError("不支持的LLM模型类型，需要tokenizer/model或generate/chat方法")
+                
+        except Exception as e:
+            raise RuntimeError(f"LLM调用失败: {e}")
 
 if __name__ == "__main__":
     # 测试

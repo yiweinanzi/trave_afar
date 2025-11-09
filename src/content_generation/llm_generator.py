@@ -41,7 +41,18 @@ class LLMGenerator:
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             
-            model_path = self.model_path or "Qwen/Qwen2.5-0.5B-Instruct"
+            # 优先使用指定的模型路径，否则使用本地Qwen3-8B模型
+            if self.model_path:
+                model_path = self.model_path
+            else:
+                # 检查本地模型路径
+                local_model_path = "/root/autodl-tmp/goafar_project/models/models--Qwen--Qwen3-8B"
+                if os.path.exists(local_model_path):
+                    model_path = local_model_path
+                    print(f"使用本地模型: {model_path}")
+                else:
+                    # 回退到HuggingFace模型名称
+                    model_path = "Qwen/Qwen3-8B"
             
             print(f"加载 Qwen 模型: {model_path}")
             self.tokenizer = AutoTokenizer.from_pretrained(

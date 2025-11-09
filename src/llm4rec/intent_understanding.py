@@ -178,18 +178,61 @@ class IntentUnderstandingModule:
         if self.llm_model is None:
             raise ValueError("LLM模型未初始化")
         
-        # 这里需要根据具体的LLM实现调用
-        # 示例：Qwen模型调用
-        messages = [
-            {"role": "system", "content": "你是专业的旅游规划助手"},
-            {"role": "user", "content": prompt}
-        ]
-        
-        # TODO: 实现具体的模型调用逻辑
-        # response = self.llm_model.generate(messages)
-        # return response
-        
-        raise NotImplementedError("需要实现具体的LLM调用逻辑")
+        # 复用llm_generator中的LLM调用逻辑
+        try:
+            # 如果llm_model是LLMGenerator实例
+            if hasattr(self.llm_model, 'tokenizer') and hasattr(self.llm_model, 'model'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游规划助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                text = self.llm_model.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                
+                model_inputs = self.llm_model.tokenizer([text], return_tensors="pt").to(self.llm_model.model.device)
+                
+                generated_ids = self.llm_model.model.generate(
+                    **model_inputs,
+                    max_new_tokens=200,
+                    temperature=0.3,
+                    do_sample=True
+                )
+                
+                generated_ids = [
+                    output_ids[len(input_ids):] 
+                    for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+                ]
+                
+                response = self.llm_model.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                return response.strip()
+            
+            # 如果llm_model有generate方法
+            elif hasattr(self.llm_model, 'generate'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游规划助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                response = self.llm_model.generate(messages)
+                return response
+            
+            # 如果llm_model有chat方法（API调用）
+            elif hasattr(self.llm_model, 'chat'):
+                messages = [
+                    {"role": "system", "content": "你是专业的旅游规划助手"},
+                    {"role": "user", "content": prompt}
+                ]
+                response = self.llm_model.chat(messages)
+                return response
+            
+            else:
+                raise ValueError("不支持的LLM模型类型，需要tokenizer/model或generate/chat方法")
+                
+        except Exception as e:
+            raise RuntimeError(f"LLM调用失败: {e}")
     
     def _expand_query(self, intent_result):
         """基于意图结果扩展查询"""
