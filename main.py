@@ -12,6 +12,8 @@ from recommendation.candidate_merger import merge_candidates
 from routing.time_matrix_builder import build_time_matrix
 from routing.vrptw_solver import VRPTWSolver
 from llm_integration import GoAfarLLM
+from llm4rec.intent_understanding import IntentUnderstandingModule
+from llm4rec.llm_reranker import LLMReranker
 import pandas as pd
 import json
 
@@ -25,7 +27,7 @@ def get_llm(mode='template'):
         _llm_instance = GoAfarLLM(mode=mode)
     return _llm_instance
 
-def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20, user_id=None):
+def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20, user_id=None, use_llm=True):
     """
     端到端路线推荐
     
@@ -35,6 +37,7 @@ def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20,
         max_hours: 最大行程时间（小时）
         topk_candidates: 候选POI数量
         user_id: 用户ID（可选）
+        use_llm: 是否使用LLM4Rec增强（意图理解和重排序）
     
     Returns:
         dict: 推荐结果
@@ -45,13 +48,36 @@ def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20,
     print(f"查询: {query_text}")
     print(f"省份: {province or '自动识别'}")
     print(f"最大行程: {max_hours} 小时")
+    print(f"LLM增强: {'是' if use_llm else '否'}")
     
-    # Step 1: 候选召回
-    print(f"\n【步骤 1/4】候选池召回")
+    # Step 1: LLM意图理解（如果启用）
+    if use_llm:
+        print(f"\n【步骤 1/5】LLM 意图理解")
+        print("-"*80)
+        intent_module = IntentUnderstandingModule(use_template=True)
+        intent = intent_module.understand(query_text)
+        
+        # 如果自动识别到省份，使用它
+        if province is None and intent.get('province'):
+            province = intent['province']
+            print(f"✓ 自动识别省份: {province}")
+        
+        # 使用意图中的关键词进行检索
+        if intent.get('keywords'):
+            search_query = ' '.join(intent['keywords'])
+            print(f"✓ 扩展查询: {search_query}")
+        else:
+            search_query = query_text
+    else:
+        intent = {}
+        search_query = query_text
+    
+    # Step 2: 候选召回
+    print(f"\n【步骤 2/5】候选池召回")
     print("-"*80)
     
     candidates = merge_candidates(
-        query_text=query_text,
+        query_text=search_query,
         user_id=user_id,
         topk_dense=50,
         topk_seq=30,
@@ -61,20 +87,29 @@ def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20,
     if len(candidates) == 0:
         return {"error": "未找到匹配的景点"}
     
-    # Step 2: 选择Top候选
-    top_candidates = candidates.head(topk_candidates)
-    print(f"\n选择 Top {len(top_candidates)} 候选进行路线规划")
+    # Step 3: LLM重排序（如果启用）
+    if use_llm and len(candidates) > 0:
+        print(f"\n【步骤 3/5】LLM 重排序")
+        print("-"*80)
+        reranker = LLMReranker(use_template=True)
+        candidates_reranked = reranker.rerank(candidates, intent, topk=topk_candidates)
+        print(f"✓ 重排序完成，保留 {len(candidates_reranked)} 个候选")
+    else:
+        candidates_reranked = candidates.head(topk_candidates)
+        print(f"\n选择 Top {len(candidates_reranked)} 候选进行路线规划")
     
-    # Step 3: 构建时间矩阵
-    print(f"\n【步骤 2/4】构建时间矩阵")
+    # Step 4: 构建时间矩阵
+    step_num = "4/5" if use_llm else "3/4"
+    print(f"\n【步骤 {step_num}】构建时间矩阵")
     print("-"*80)
     
     time_matrix, poi_df_filtered = build_time_matrix(
-        poi_ids=top_candidates['poi_id'].tolist()
+        poi_ids=candidates_reranked['poi_id'].tolist()
     )
     
-    # Step 4: VRPTW路线规划
-    print(f"\n【步骤 3/4】VRPTW 路线规划")
+    # Step 5: VRPTW路线规划
+    step_num = "5/5" if use_llm else "4/4"
+    print(f"\n【步骤 {step_num}】VRPTW 路线规划")
     print("-"*80)
     
     solver = VRPTWSolver(poi_df_filtered, time_matrix)
@@ -87,12 +122,13 @@ def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20,
     if not solution:
         return {"error": "未找到可行路线"}
     
-    # Step 5: 生成文案
-    print(f"\n【步骤 4/4】生成推荐文案")
+    # Step 6: 生成文案
+    step_num = "6/6" if use_llm else "5/5"
+    print(f"\n【步骤 {step_num}】生成推荐文案")
     print("-"*80)
     
     route_pois = solution['routes'][0]  # 取第一条路线
-    province_name = province or top_candidates.iloc[0]['province']
+    province_name = province or candidates_reranked.iloc[0]['province']
     
     # 使用LLM生成（或模板）
     llm = get_llm(mode='template')  # 可改为 'local' 或 'api'
@@ -115,7 +151,8 @@ def recommend_route(query_text, province=None, max_hours=10, topk_candidates=20,
         'total_hours': solution['total_time_hours'],
         'num_pois': solution['visited_pois'],
         'query': query_text,
-        'province': province_name
+        'province': province_name,
+        'user_intent': intent if use_llm else None
     }
     
     return result

@@ -52,9 +52,19 @@ def build_time_matrix(poi_csv='data/poi.csv',
     
     # 筛选指定的POI
     if poi_ids is not None:
-        df = df[df['poi_id'].isin(poi_ids)].reset_index(drop=True)
+        df_filtered = df[df['poi_id'].isin(poi_ids)].reset_index(drop=True)
+        if len(df_filtered) == 0:
+            raise ValueError(f"未找到指定的POI ID: {poi_ids[:5]}... (共{len(poi_ids)}个)")
+        df = df_filtered
+        # 检查是否有缺失的POI ID
+        missing_ids = set(poi_ids) - set(df['poi_id'].tolist())
+        if missing_ids:
+            print(f"⚠️ 警告: 以下POI ID不存在: {list(missing_ids)[:5]}...")
     
     n = len(df)
+    if n == 0:
+        raise ValueError("POI数据为空，无法构建时间矩阵")
+    
     print(f"构建时间矩阵: {n}x{n}")
     print(f"平均速度: {avg_speed_kmh} km/h")
     
@@ -85,9 +95,18 @@ def build_time_matrix(poi_csv='data/poi.csv',
     
     print(f"\n✓ 时间矩阵保存到: {output_path}")
     print(f"  矩阵维度: {T.shape}")
-    print(f"  平均行程时间: {T[T > 0].mean() / 60:.2f} 分钟")
-    print(f"  最大行程时间: {T.max() / 60:.2f} 分钟")
-    print(f"  最小行程时间: {T[T > 0].min() / 60:.2f} 分钟")
+    
+    # 安全地计算统计信息
+    if n > 1 and T.size > 0:
+        non_zero = T[T > 0]
+        if len(non_zero) > 0:
+            print(f"  平均行程时间: {non_zero.mean() / 60:.2f} 分钟")
+            print(f"  最大行程时间: {non_zero.max() / 60:.2f} 分钟")
+            print(f"  最小行程时间: {non_zero.min() / 60:.2f} 分钟")
+        else:
+            print("  警告: 时间矩阵全为0")
+    else:
+        print("  警告: POI数量不足，无法计算统计信息")
     
     return T, df
 

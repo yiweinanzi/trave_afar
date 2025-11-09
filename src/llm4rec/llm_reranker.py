@@ -58,7 +58,13 @@ class LLMReranker:
         candidates = candidates_df.copy()
         
         # 初始分数（来自语义检索 semantic_score）
-        candidates['rerank_score'] = candidates.get('final_score', candidates.get('semantic_score', 0.5))
+        if 'semantic_score' in candidates.columns:
+            candidates['rerank_score'] = candidates['semantic_score'].copy()
+        elif 'final_score' in candidates.columns:
+            candidates['rerank_score'] = candidates['final_score'].copy()
+        else:
+            # 如果没有分数列，使用默认值
+            candidates['rerank_score'] = 0.5
         
         # 1. 兴趣匹配加权
         interests = user_intent.get('interests', [])

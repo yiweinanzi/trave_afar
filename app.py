@@ -101,10 +101,21 @@ def recommend_route_ui(query, province_choice, max_hours, topk, use_llm_rerank):
         if use_llm_rerank:
             candidates_reranked = reranker.rerank(candidates, intent, topk=topk)
         else:
-            candidates_reranked = candidates.head(topk)
+            candidates_reranked = candidates.head(topk).copy()
+        
+        # 确定分数列名（rerank_score > semantic_score > 默认0.5）
+        if 'rerank_score' in candidates_reranked.columns:
+            score_col = 'rerank_score'
+        elif 'semantic_score' in candidates_reranked.columns:
+            score_col = 'semantic_score'
+        else:
+            # 如果没有分数列，创建一个默认值
+            candidates_reranked['score'] = 0.5
+            score_col = 'score'
         
         # 召回结果展示
-        recall_df = candidates_reranked.head(10)[['name', 'city', 'province', 'final_score']].copy()
+        display_cols = ['name', 'city', 'province', score_col]
+        recall_df = candidates_reranked.head(10)[display_cols].copy()
         recall_df.columns = ['景点名称', '城市', '省份', '综合分数']
         recall_df['综合分数'] = recall_df['综合分数'].round(4)
         
@@ -115,6 +126,16 @@ def recommend_route_ui(query, province_choice, max_hours, topk, use_llm_rerank):
         planning_text = f"\n\n**路线规划中...**\n"
         planning_text += f"- 候选POI: {len(candidates_reranked)}个\n"
         planning_text += f"- 最大时长: {max_hours}小时\n\n"
+        
+        # 检查poi_id列
+        if 'poi_id' not in candidates_reranked.columns:
+            # 如果没有poi_id列，尝试从索引获取或创建
+            if candidates_reranked.index.name == 'poi_id' or isinstance(candidates_reranked.index, pd.RangeIndex):
+                # 尝试从索引恢复
+                candidates_reranked = candidates_reranked.reset_index()
+            else:
+                # 创建默认poi_id（使用索引）
+                candidates_reranked['poi_id'] = candidates_reranked.index
         
         # 构建时间矩阵
         time_matrix, poi_df_filtered = build_time_matrix(
