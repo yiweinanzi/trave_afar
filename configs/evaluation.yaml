@@ -1,0 +1,103 @@
+# GoAfar 评测配置
+
+evaluation:
+  output_dir: outputs/evaluation
+  max_samples: 100
+  batch_size: 4
+  use_gpu: true
+
+# SFT评测配置
+sft:
+  model_path: outputs/sft/qwen3-8b-tourism
+  test_data: outputs/datasets/sft_data.jsonl
+  max_new_tokens: 256
+  temperature: 0.1
+
+  metrics:
+    - intent_understanding
+    - route_generation
+    - content_generation
+
+  intent_understanding:
+    weight_province: 1.0
+    weight_duration: 0.5
+    weight_interests: 0.8
+
+  route_generation:
+    min_poi_count: 3
+    day_match_bonus: 0.2
+
+  content_generation:
+    min_title_length: 5
+    min_desc_length: 10
+
+# DPO评测配置
+dpo:
+  model_path: outputs/dpo/qwen3-8b-dpo
+  test_data: outputs/datasets/dpo_prefs.csv
+  max_new_tokens: 128
+
+  metrics:
+    - preference_accuracy
+    - reward_score
+    - chosen_vs_rejected
+
+  preference_accuracy:
+    threshold: 0.5
+
+  reward_weights:
+    relevance: 0.4
+    completeness: 0.3
+    readability: 0.2
+    quality: 0.1
+
+# GRPO评测配置
+grpo:
+  model_path: outputs/grpo/qwen3-8b-grpo
+  test_data: outputs/datasets/grpo_planner_prompts.jsonl
+  poi_data: data/all/poi_expanded.csv
+
+  metrics:
+    - next_poi_accuracy
+    - route_feasibility
+    - reward_comparison
+
+  reward_weights:
+    next_poi_correct: 2.0
+    partial_overlap: 1.0
+    route_similarity: 0.5
+    novelty_bonus: 0.1
+
+# 端到端评测配置
+pipeline:
+  use_llm: true
+  test_queries: null  # null表示使用默认查询
+
+  metrics:
+    - success_rate
+    - latency
+    - route_feasibility
+
+  latency_breakdown:
+    - intent
+    - recall
+    - rerank
+    - plan
+
+# 评测报告配置
+report:
+  format: json
+  save_intermediate: true
+  verbose: true
+
+  thresholds:
+    sft:
+      province_accuracy: 0.80
+      poi_overlap: 0.60
+    dpo:
+      preference_accuracy: 0.70
+    grpo:
+      next_poi_accuracy: 0.30
+    pipeline:
+      success_rate: 0.80
+      avg_latency: 3.0
