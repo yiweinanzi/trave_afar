@@ -13,13 +13,17 @@ QLoRA配置：
 - 4-bit量化 (NF4)
 - LoRA适配器 (r=16, alpha=16)
 - 双数量化以进一步减少显存
+
+实验追踪：
+- 支持MLflow自动追踪训练参数和指标
+- 自动记录模型和训练配置
 """
 import os
 import sys
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import pandas as pd
@@ -35,6 +39,19 @@ from trl import SFTTrainer, SFTConfig
 
 # 添加src到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 导入实验追踪模块
+try:
+    from src.utils.experiment import (
+        MLflowExperiment,
+        ExperimentConfig,
+        ExperimentManager,
+        MLflowCallback,
+    )
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: MLflow tracking not available. Install with: pip install mlflow")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_CACHE_DIR = Path(os.getenv("GOAFAR_MODEL_CACHE", str(PROJECT_ROOT / "models")))
@@ -56,10 +73,10 @@ def _resolve_model_path(model_name: str = None) -> str:
         if path.exists():
             return str(path)
 
-    return model_name or "Qwen/Qwen3-8B"
+    return model_name or str(MODEL_CACHE_DIR / "Qwen3-8B")
 
 
-def load_sft_data(data_path: str) -> Dataset:
+def load_sft_data(data_path: str, allow_sample_data: bool = False) -> Dataset:
     """
     加载SFT训练数据
 
@@ -70,9 +87,14 @@ def load_sft_data(data_path: str) -> Dataset:
     data_path = Path(data_path)
 
     if not data_path.exists():
-        print(f"数据文件不存在: {data_path}")
-        print("创建示例数据...")
-        return create_sample_data()
+        if allow_sample_data:
+            print(f"数据文件不存在: {data_path}")
+            print("创建示例数据...")
+            return create_sample_data()
+        raise FileNotFoundError(
+            f"SFT训练数据不存在: {data_path}. "
+            "如需使用示例数据，请显式设置 allow_sample_data=True。"
+        )
 
     if data_path.suffix == ".jsonl":
         with open(data_path, "r", encoding="utf-8") as f:
@@ -176,6 +198,11 @@ def train_sft(
     gradient_accumulation_steps: int = 4,
     max_seq_length: int = 512,
     use_gpu: bool = True,
+    allow_sample_data: bool = False,
+    # 实验追踪参数
+    use_mlflow: bool = True,
+    mlflow_tracking_uri: Optional[str] = None,
+    mlflow_experiment_name: str = "sft_tourism",
 ):
     """
     使用QLoRA训练SFT模型
@@ -194,10 +221,30 @@ def train_sft(
         gradient_accumulation_steps: 梯度累积步数
         max_seq_length: 最大序列长度
         use_gpu: 是否使用GPU
+        use_mlflow: 是否启用MLflow实验追踪
+        mlflow_tracking_uri: MLflow服务器地址
+        mlflow_experiment_name: MLflow实验名称
     """
     print("=" * 80)
     print("SFT训练 - 旅游推荐任务监督微调 (QLoRA)")
     print("=" * 80)
+
+    # 初始化实验追踪
+    experiment_tracker = None
+    if use_mlflow and MLFLOW_AVAILABLE:
+        print(f"初始化MLflow实验追踪: {mlflow_experiment_name}")
+        config = ExperimentConfig(
+            enabled=True,
+            tracking_uri=mlflow_tracking_uri,
+            tags={"task": "sft", "model": "Qwen3-8B"},
+        )
+        manager = ExperimentManager(
+            mlflow_tracking_uri=mlflow_tracking_uri,
+            config=config,
+        )
+        experiment_tracker = manager.create_experiment(mlflow_experiment_name)
+        if hasattr(experiment_tracker, 'start_run'):
+            experiment_tracker.start_run()
 
     # 检查GPU
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
@@ -214,7 +261,16 @@ def train_sft(
         print(f"使用HuggingFace模型: {model_path}")
 
     # 加载数据
-    dataset = load_sft_data(data_path)
+    dataset = load_sft_data(data_path, allow_sample_data=allow_sample_data)
+
+    # 记录数据集信息
+    if experiment_tracker:
+        dataset_info = {
+            "data_path": data_path,
+            "num_samples": len(dataset),
+            "max_seq_length": max_seq_length,
+        }
+        experiment_tracker.log_dataset(dataset_info)
 
     # 加载tokenizer
     print(f"\n加载tokenizer: {model_path}")
@@ -226,6 +282,25 @@ def train_sft(
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # 记录训练参数
+    if experiment_tracker:
+        params = {
+            "model_path": model_path,
+            "data_path": data_path,
+            "output_dir": output_dir,
+            "use_qlora": use_qlora,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "max_seq_length": max_seq_length,
+            "device": device,
+        }
+        experiment_tracker.log_params(params)
 
     # QLoRA: 4-bit量化配置
     bnb_config = None
@@ -326,6 +401,47 @@ def train_sft(
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
+    # 记录最终指标和模型
+    if experiment_tracker:
+        # 记录训练日志中的最终指标
+        if hasattr(trainer.state, 'log_history') and trainer.state.log_history:
+            final_metrics = {}
+            for log in trainer.state.log_history[-5:]:  # 最后几条日志
+                for k, v in log.items():
+                    if isinstance(v, (int, float)) and k != 'epoch':
+                        final_metrics[f'final_{k}'] = v
+            experiment_tracker.log_metrics(final_metrics)
+
+        # 记录模型
+        experiment_tracker.log_model(
+            output_dir,
+            name="sft_model",
+            model_type="huggingface"
+        )
+
+        # 记录训练配置
+        config_path = Path(output_dir) / "training_config.json"
+        training_config = {
+            "model_path": model_path,
+            "data_path": data_path,
+            "output_dir": output_dir,
+            "use_qlora": use_qlora,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "max_seq_length": max_seq_length,
+        }
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(training_config, f, indent=2, ensure_ascii=False)
+        experiment_tracker.log_artifact(str(config_path))
+
+        # 结束实验
+        experiment_tracker.finish(status="FINISHED")
+
     print("\n✅ SFT训练完成！")
     print(f"模型保存位置: {output_dir}")
 
@@ -348,6 +464,7 @@ if __name__ == "__main__":
     parser.add_argument('--grad-accum', type=int, default=4, help='梯度累积步数')
     parser.add_argument('--max-length', type=int, default=512, help='最大序列长度')
     parser.add_argument('--no-gpu', action='store_true', help='不使用GPU')
+    parser.add_argument('--allow-sample-data', action='store_true', help='缺失训练数据时允许回退到内置示例数据')
 
     args = parser.parse_args()
 
@@ -364,5 +481,6 @@ if __name__ == "__main__":
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         max_seq_length=args.max_length,
-        use_gpu=not args.no_gpu
+        use_gpu=not args.no_gpu,
+        allow_sample_data=args.allow_sample_data,
     )

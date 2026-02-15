@@ -63,7 +63,7 @@ class GRPOModelEvaluator:
             is_lora = True
             with open(Path(self.model_path) / "adapter_config.json") as f:
                 adapter_config = json.load(f)
-            base_model_path = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-8B")
+            base_model_path = adapter_config.get("base_model_name_or_path", "models/Qwen3-8B")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
@@ -180,6 +180,7 @@ class RouteRewardCalculator:
 
         # 3. 序列相似度（考虑顺序）
         min_len = min(len(predicted_route), len(target_route))
+        max_len = max(len(predicted_route), len(target_route))
         matches = sum(1 for i in range(min_len) if predicted_route[i] == target_route[i])
         metrics["route_similarity"] = matches / max_len if min_len > 0 else 0.0
 

@@ -78,26 +78,28 @@ if [ -n "${VIRTUAL_ENV}" ]; then
 fi
 
 # Build command arguments
-TRAIN_ARGS="--model \"${MODEL_PATH}\""
-TRAIN_ARGS="${TRAIN_ARGS} --prefs \"${DATA_PATH}\""
-TRAIN_ARGS="${TRAIN_ARGS} --output \"${OUTPUT_DIR}\""
-TRAIN_ARGS="${TRAIN_ARGS} --epochs ${EPOCHS}"
-TRAIN_ARGS="${TRAIN_ARGS} --batch-size ${BATCH_SIZE}"
-TRAIN_ARGS="${TRAIN_ARGS} --grad-accum ${GRAD_ACCUM}"
-TRAIN_ARGS="${TRAIN_ARGS} --lr ${LR}"
-TRAIN_ARGS="${TRAIN_ARGS} --beta ${BETA}"
-TRAIN_ARGS="${TRAIN_ARGS} --max-length ${MAX_LENGTH}"
+TRAIN_ARGS=(
+    --model "${MODEL_PATH}"
+    --prefs "${DATA_PATH}"
+    --output "${OUTPUT_DIR}"
+    --epochs "${EPOCHS}"
+    --batch-size "${BATCH_SIZE}"
+    --grad-accum "${GRAD_ACCUM}"
+    --lr "${LR}"
+    --beta "${BETA}"
+    --max-length "${MAX_LENGTH}"
+)
 
 # Handle LoRA/QLoRA flags
 if [ "${USE_LORA}" = "true" ]; then
-    TRAIN_ARGS="${TRAIN_ARGS} --use-lora"
+    TRAIN_ARGS+=(--use-lora)
     if [ "${USE_QLORA}" = "true" ]; then
-        TRAIN_ARGS="${TRAIN_ARGS} --use-qlora"
+        TRAIN_ARGS+=(--use-qlora)
     else
-        TRAIN_ARGS="${TRAIN_ARGS} --no-qlora"
+        TRAIN_ARGS+=(--no-qlora)
     fi
 else
-    TRAIN_ARGS="${TRAIN_ARGS} --no-lora"
+    TRAIN_ARGS+=(--no-lora)
 fi
 
 # Run training
@@ -105,7 +107,7 @@ echo ""
 echo "Starting DPO training..."
 echo ""
 
-python -m src.content_generation.train_dpo ${TRAIN_ARGS}
+python -m src.content_generation.train_dpo "${TRAIN_ARGS[@]}"
 
 echo ""
 echo "=========================================="

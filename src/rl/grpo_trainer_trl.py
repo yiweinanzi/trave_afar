@@ -9,6 +9,7 @@ Key features:
 - Custom reward function for route planning
 - Supports distributed training
 - Better logging and checkpointing
+- Integrated MLflow experiment tracking
 
 Requirements:
     pip install trl>=0.12.0
@@ -20,9 +21,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import pandas as pd
@@ -39,8 +44,17 @@ except ImportError:
     TRL_AVAILABLE = False
     logger.warning("TRL not installed. Install with: pip install trl")
 
-
 from .reward_manager import RewardManager, RewardWeights
+
+# 导入实验追踪模块
+try:
+    from src.utils.experiment import (
+        ExperimentConfig,
+        ExperimentManager,
+    )
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
 
 
 @dataclass
@@ -48,7 +62,7 @@ class TourismGRPOConfig:
     """Configuration for tourism route planning GRPO training."""
 
     # Model
-    model_name_or_path: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_name_or_path: str = "models/Qwen3-8B"
     tokenizer_name_or_path: Optional[str] = None
     trust_remote_code: bool = True
 
@@ -87,6 +101,11 @@ class TourismGRPOConfig:
 
     # Reward weights
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
+
+    # Experiment tracking
+    use_mlflow: bool = True  # Enable MLflow tracking
+    mlflow_tracking_uri: Optional[str] = None  # MLflow server URI
+    mlflow_experiment_name: str = "grpo_planner_trl"  # Experiment name
 
 
 class TourismRewardFunction:
@@ -141,11 +160,18 @@ class TourismRewardFunction:
             List of reward scores
         """
         rewards = []
+        metadata_list = kwargs.get("metadata", [])
 
-        for prompt, completion in zip(prompts, completions):
+        for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
             try:
                 # Extract metadata from prompt if available
-                metadata = self._parse_prompt_metadata(prompt)
+                metadata = {}
+                if isinstance(metadata_list, list) and idx < len(metadata_list):
+                    candidate = metadata_list[idx]
+                    if isinstance(candidate, dict):
+                        metadata = candidate
+                if not metadata:
+                    metadata = self._parse_prompt_metadata(prompt)
 
                 # Extract POI ID from completion
                 poi_id = self._extract_poi_id(completion)
@@ -279,9 +305,15 @@ class TourismGRPODataset(torch.utils.data.Dataset):
             {"role": "user", "content": self._format_user_message(prompt_dict)},
         ]
 
+        metadata = dict(prompt_dict)
+        if "target_next_poi" in item and item.get("target_next_poi") not in (None, ""):
+            metadata["target_next_poi"] = str(item.get("target_next_poi"))
+        if "full_target_route" in item and isinstance(item.get("full_target_route"), list):
+            metadata["full_target_route"] = item.get("full_target_route")
+
         return {
             "prompt": json.dumps(messages, ensure_ascii=False),
-            "metadata": prompt_dict,
+            "metadata": metadata,
         }
 
     def _format_user_message(self, prompt_dict: Dict) -> str:
@@ -315,6 +347,42 @@ def train_grpo_with_trl(config: TourismGRPOConfig):
         )
 
     logger.info("Initializing TRL-based GRPO training...")
+
+    # Initialize experiment tracking
+    experiment_tracker = None
+    if config.use_mlflow and MLFLOW_AVAILABLE:
+        logger.info(f"Initializing MLflow experiment tracking: {config.mlflow_experiment_name}")
+        exp_config = ExperimentConfig(
+            enabled=True,
+            tracking_uri=config.mlflow_tracking_uri,
+            tags={"task": "grpo_trl", "model": config.model_name_or_path},
+        )
+        manager = ExperimentManager(
+            mlflow_tracking_uri=config.mlflow_tracking_uri,
+            config=exp_config,
+        )
+        experiment_tracker = manager.create_experiment(config.mlflow_experiment_name)
+        if hasattr(experiment_tracker, 'start_run'):
+            experiment_tracker.start_run()
+
+        # Log configuration
+        params = {
+            "model_name_or_path": config.model_name_or_path,
+            "train_data": config.train_data,
+            "output_dir": config.output_dir,
+            "group_size": config.group_size,
+            "kl_coef": config.kl_coef,
+            "learning_rate": config.learning_rate,
+            "batch_size": config.batch_size,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "num_train_epochs": config.num_train_epochs,
+            "max_prompt_length": config.max_prompt_length,
+            "max_completion_length": config.max_completion_length,
+            "use_lora": config.use_lora,
+            "lora_r": config.lora_r,
+            "lora_alpha": config.lora_alpha,
+        }
+        experiment_tracker.log_params(params)
 
     # Load model and tokenizer
     logger.info(f"Loading model from {config.model_name_or_path}")
@@ -352,6 +420,14 @@ def train_grpo_with_trl(config: TourismGRPOConfig):
     logger.info(f"Loading dataset from {config.train_data}")
     train_dataset = TourismGRPODataset(config.train_data)
     logger.info(f"Loaded {len(train_dataset)} samples")
+
+    # Log dataset info
+    if experiment_tracker:
+        dataset_info = {
+            "train_data": config.train_data,
+            "num_samples": len(train_dataset),
+        }
+        experiment_tracker.log_dataset(dataset_info)
 
     # Configure LoRA
     lora_config = None
@@ -402,6 +478,26 @@ def train_grpo_with_trl(config: TourismGRPOConfig):
     logger.info(f"Saving model to {config.output_dir}")
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
+
+    # Finalize experiment tracking
+    if experiment_tracker:
+        # Log final metrics
+        if hasattr(trainer.state, 'log_history') and trainer.state.log_history:
+            final_metrics = {}
+            for log in trainer.state.log_history[-5:]:
+                for k, v in log.items():
+                    if isinstance(v, (int, float)) and k != 'epoch':
+                        final_metrics[f'final_{k}'] = v
+            experiment_tracker.log_metrics(final_metrics)
+
+        # Log model
+        experiment_tracker.log_model(
+            config.output_dir,
+            name="grpo_trl_model",
+            model_type="huggingface"
+        )
+
+        experiment_tracker.finish(status="FINISHED")
 
     logger.info("Training completed successfully!")
     return trainer

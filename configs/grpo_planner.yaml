@@ -1,7 +1,7 @@
 planner_grpo:
-  model_name: Qwen/Qwen3-8B
-  train_data: outputs/datasets/planner_rl_prompts.jsonl
-  val_data: outputs/datasets/planner_rl_prompts.jsonl
+  model_name: models/Qwen3-8B
+  train_data: outputs/datasets/grpo_planner_prompts.jsonl
+  val_data: outputs/datasets/grpo_planner_prompts.jsonl
   max_prompt_len: 1024
   max_response_len: 256
 
@@ -29,4 +29,3 @@ planner_grpo:
     overtime_penalty: 1.2
     travel_penalty: 0.003
     diversity_weight: 0.3
-

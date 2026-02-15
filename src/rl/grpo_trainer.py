@@ -11,6 +11,7 @@ Key features:
 - Hybrid reward: rule-based (feasibility) + model-based (preference score)
 - Compatible with Qwen3-8B as the base policy model
 - Supports both TRL (default) and veRL backends
+- Integrated MLflow experiment tracking
 
 References:
 - GRPO paper: https://arxiv.org/abs/2406.01806 (DeepSeekMath)
@@ -21,9 +22,14 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import pandas as pd
@@ -37,6 +43,16 @@ from tqdm import tqdm
 from .dataset_builder import _iter_jsonl
 from .reward_manager import RewardManager, RewardWeights
 
+# 导入实验追踪模块
+try:
+    from src.utils.experiment import (
+        ExperimentConfig,
+        ExperimentManager,
+    )
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +61,7 @@ class GRPOConfig:
     """Configuration for GRPO training."""
 
     # Model
-    model_name_or_path: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_name_or_path: str = "models/Qwen3-8B"
     tokenizer_name_or_path: Optional[str] = None
     trust_remote_code: bool = True
 
@@ -54,6 +70,7 @@ class GRPOConfig:
     kl_coef: float = 0.1  # KL divergence coefficient
     clip_range: float = 0.2  # PPO-style clipping ratio
     use_grpo_advantage: bool = True  # Use group-relative advantage (no critic)
+    use_reference_model: bool = True  # Use a reference policy for KL regularization
 
     # Training
     learning_rate: float = 1e-5
@@ -90,6 +107,11 @@ class GRPOConfig:
 
     # Optional: veRL backend (if installed)
     use_verl: bool = False
+
+    # Experiment tracking
+    use_mlflow: bool = True  # Enable MLflow tracking
+    mlflow_tracking_uri: Optional[str] = None  # MLflow server URI
+    mlflow_experiment_name: str = "grpo_planner"  # Experiment name
 
 
 class RoutePlanningDataset(torch.utils.data.Dataset):
@@ -187,6 +209,25 @@ class GRPOTrainer:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
 
+        # Initialize experiment tracking
+        self.experiment_tracker = None
+        if config.use_mlflow and MLFLOW_AVAILABLE:
+            logger.info(f"Initializing MLflow experiment tracking: {config.mlflow_experiment_name}")
+            exp_config = ExperimentConfig(
+                enabled=True,
+                tracking_uri=config.mlflow_tracking_uri,
+                tags={"task": "grpo", "model": "Qwen3-8B"},
+            )
+            self.experiment_manager = ExperimentManager(
+                mlflow_tracking_uri=config.mlflow_tracking_uri,
+                config=exp_config,
+            )
+            self.experiment_tracker = self.experiment_manager.create_experiment(
+                config.mlflow_experiment_name
+            )
+            if hasattr(self.experiment_tracker, 'start_run'):
+                self.experiment_tracker.start_run()
+
         # Load model and tokenizer
         logger.info(f"Loading model from {config.model_name_or_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -207,6 +248,11 @@ class GRPOTrainer:
         if config.use_lora:
             self._setup_lora()
 
+        # Initialize reference policy used by KL regularization.
+        self.ref_model: Optional[PreTrainedModel] = None
+        self._reference_mode = "none"
+        self._init_reference_policy()
+
         # Load dataset
         logger.info(f"Loading training data from {config.train_data}")
         self.train_dataset = RoutePlanningDataset(
@@ -216,6 +262,10 @@ class GRPOTrainer:
             max_prompt_length=config.max_prompt_length,
         )
         logger.info(f"Loaded {len(self.train_dataset)} training samples")
+
+        # Log configuration after dataset is ready.
+        if self.experiment_tracker:
+            self._log_config_to_experiment()
 
         # Reward manager
         self.reward_manager = RewardManager(weights=config.reward_weights)
@@ -235,6 +285,40 @@ class GRPOTrainer:
         self.global_step = 0
         self.best_reward = -float("inf")
 
+    def _log_config_to_experiment(self):
+        """Log configuration parameters to experiment tracker."""
+        if not self.experiment_tracker:
+            return
+
+        params = {
+            "model_name_or_path": self.config.model_name_or_path,
+            "train_data": self.config.train_data,
+            "output_dir": self.config.output_dir,
+            "group_size": self.config.group_size,
+            "kl_coef": self.config.kl_coef,
+            "learning_rate": self.config.learning_rate,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "num_train_epochs": self.config.num_train_epochs,
+            "max_length": self.config.max_length,
+            "max_prompt_length": self.config.max_prompt_length,
+            "max_new_tokens": self.config.max_new_tokens,
+            "use_lora": self.config.use_lora,
+            "lora_r": self.config.lora_r,
+            "lora_alpha": self.config.lora_alpha,
+            "lora_dropout": self.config.lora_dropout,
+            "device": self.config.device,
+        }
+        self.experiment_tracker.log_params(params)
+
+        # Log dataset info
+        dataset = getattr(self, "train_dataset", None)
+        dataset_info = {
+            "train_data": self.config.train_data,
+            "num_samples": len(dataset) if dataset is not None else 0,
+        }
+        self.experiment_tracker.log_dataset(dataset_info)
+
     def _setup_lora(self):
         """Apply LoRA adapters to the model."""
         try:
@@ -252,6 +336,52 @@ class GRPOTrainer:
             logger.info("LoRA adapters applied successfully")
         except ImportError:
             logger.warning("peft not installed, skipping LoRA")
+
+    def _init_reference_policy(self) -> None:
+        """Initialize a stable reference policy for KL regularization."""
+        if self.config.kl_coef <= 0:
+            self._reference_mode = "none"
+            return
+
+        if not self.config.use_reference_model:
+            logger.warning("Reference policy disabled; KL regularization will be ineffective.")
+            self._reference_mode = "self_detached"
+            return
+
+        # Preferred path for LoRA: temporarily disable adapters and use base model as reference.
+        if self.config.use_lora and hasattr(self.model, "disable_adapter"):
+            self._reference_mode = "lora_base"
+            logger.info("KL reference policy: base model with LoRA adapters disabled")
+            return
+
+        # Non-LoRA full-model training on CUDA would require a second large model copy.
+        if self.config.device == "cuda":
+            logger.warning(
+                "Skipping frozen reference model on CUDA to avoid OOM; "
+                "KL regularization will be ineffective in this mode."
+            )
+            self._reference_mode = "self_detached"
+            return
+
+        try:
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name_or_path,
+                trust_remote_code=self.config.trust_remote_code,
+                torch_dtype=torch.float16 if self.config.fp16 else torch.float32,
+                device_map=None,
+            )
+            self.ref_model.to(self.device)
+            self.ref_model.eval()
+            for param in self.ref_model.parameters():
+                param.requires_grad_(False)
+            self._reference_mode = "frozen_copy"
+            logger.info("KL reference policy: frozen model copy initialized")
+        except Exception as exc:
+            logger.warning(
+                f"Failed to initialize frozen reference model ({exc}); "
+                "KL regularization will be ineffective."
+            )
+            self._reference_mode = "self_detached"
 
     def _build_poi_index(self):
         """Build POI ID to index mapping for fast lookup."""
@@ -297,9 +427,11 @@ class GRPOTrainer:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        model: Optional[PreTrainedModel] = None,
     ) -> torch.Tensor:
         """Compute log probabilities for the given sequences."""
-        outputs = self.model(
+        policy_model = model if model is not None else self.model
+        outputs = policy_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
@@ -322,6 +454,37 @@ class GRPOTrainer:
 
         return per_token_logps.sum(dim=-1)  # (batch,)
 
+    def _compute_reference_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute reference policy log-probs used by KL regularization.
+
+        Modes:
+        - lora_base: disable LoRA adapters to get base-policy log-probs
+        - frozen_copy: use a frozen reference model
+        - self_detached: degrade gracefully (no effective KL signal)
+        """
+        if self._reference_mode == "lora_base":
+            disable_ctx = self.model.disable_adapter() if hasattr(self.model, "disable_adapter") else nullcontext()
+            was_training = self.model.training
+            with torch.no_grad(), disable_ctx:
+                self.model.eval()
+                ref = self._compute_log_probs(input_ids, attention_mask, model=self.model)
+            if was_training:
+                self.model.train()
+            return ref
+
+        if self.ref_model is not None:
+            with torch.no_grad():
+                return self._compute_log_probs(input_ids, attention_mask, model=self.ref_model)
+
+        # Fallback path: keep training running, but KL term becomes ~0.
+        with torch.no_grad():
+            return self._compute_log_probs(input_ids, attention_mask, model=self.model).detach()
+
     def _compute_advantages(
         self,
         rewards: torch.Tensor,
@@ -338,6 +501,12 @@ class GRPOTrainer:
         This eliminates the need for a value network.
         """
         batch_size = rewards.shape[0]
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+        if batch_size % group_size != 0:
+            raise ValueError(
+                f"Reward batch size ({batch_size}) must be divisible by group_size ({group_size})"
+            )
         num_groups = batch_size // group_size
 
         # Reshape: (num_groups, group_size)
@@ -354,6 +523,37 @@ class GRPOTrainer:
 
         # Flatten back
         return advantages.view(batch_size)
+
+    def _decode_generated_only_texts(
+        self,
+        generated_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+    ) -> List[str]:
+        """Decode generated continuations only (exclude prompt tokens)."""
+        prompt_lengths = prompt_attention_mask.sum(dim=1).tolist()
+        texts: List[str] = []
+        for row_ids, prompt_len in zip(generated_ids, prompt_lengths):
+            continuation_ids = row_ids[int(prompt_len):]
+            texts.append(self.tokenizer.decode(continuation_ids, skip_special_tokens=True))
+        return texts
+
+    @staticmethod
+    def _expand_reward_metadata(
+        metadata_list: List[Dict],
+        target_poi_list: List[str],
+        group_size: int,
+    ) -> List[Dict]:
+        """
+        Expand per-prompt metadata to per-sample metadata with target labels attached.
+        """
+        expanded: List[Dict] = []
+        for meta, target_poi in zip(metadata_list, target_poi_list):
+            merged = dict(meta)
+            if target_poi is not None and target_poi != "":
+                merged["target_next_poi"] = str(target_poi)
+            for _ in range(group_size):
+                expanded.append(dict(merged))
+        return expanded
 
     def _compute_rewards(
         self,
@@ -519,28 +719,34 @@ class GRPOTrainer:
 
                 # Generate group of responses
                 group_size = self.config.group_size
+                expanded_prompt_ids = prompt_ids.repeat_interleave(group_size, dim=0)
+                expanded_prompt_mask = prompt_mask.repeat_interleave(group_size, dim=0)
                 all_responses = self._generate_responses(
-                    prompt_ids.repeat(group_size, 1),
-                    prompt_mask.repeat(group_size, 1),
+                    expanded_prompt_ids,
+                    expanded_prompt_mask,
                     num_responses=1,  # Already repeated
                 )
 
                 # Compute reference log probs (before update)
-                with torch.no_grad():
-                    ref_log_probs = self._compute_log_probs(
-                        all_responses,
-                        all_responses != self.tokenizer.pad_token_id,
-                    )
+                ref_log_probs = self._compute_reference_log_probs(
+                    all_responses,
+                    all_responses != self.tokenizer.pad_token_id,
+                )
 
                 # Decode generated text for reward computation
-                generated_texts = [
-                    self.tokenizer.decode(ids, skip_special_tokens=True)
-                    for ids in all_responses.cpu().numpy()
-                ]
+                generated_texts = self._decode_generated_only_texts(
+                    all_responses,
+                    expanded_prompt_mask,
+                )
+                reward_metadata = self._expand_reward_metadata(
+                    batch["metadata"],
+                    batch["target_poi"],
+                    group_size,
+                )
 
                 # Compute rewards
                 rewards = torch.tensor(
-                    self._compute_rewards(generated_texts, batch["metadata"] * group_size),
+                    self._compute_rewards(generated_texts, reward_metadata),
                     dtype=torch.float32,
                     device=self.device,
                 )
@@ -568,31 +774,65 @@ class GRPOTrainer:
                 loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
 
+                did_step = False
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
                     self.global_step += 1
+                    did_step = True
+                    mean_reward = rewards.mean().item()
+                    self.best_reward = max(self.best_reward, mean_reward)
 
                 # Logging
-                if self.global_step % self.config.logging_steps == 0:
+                if did_step and self.global_step % self.config.logging_steps == 0:
+                    metrics = {
+                        "loss": loss.item(),
+                        "policy_loss": policy_loss.item(),
+                        "kl_penalty": kl_penalty.item(),
+                        "mean_reward": rewards.mean().item(),
+                        "std_reward": rewards.std().item(),
+                    }
                     logger.info(
                         f"Step {self.global_step}: "
-                        f"loss={loss.item():.4f}, "
-                        f"policy={policy_loss.item():.4f}, "
-                        f"kl={kl_penalty.item():.4f}, "
-                        f"mean_reward={rewards.mean():.4f}"
+                        f"loss={metrics['loss']:.4f}, "
+                        f"policy={metrics['policy_loss']:.4f}, "
+                        f"kl={metrics['kl_penalty']:.4f}, "
+                        f"mean_reward={metrics['mean_reward']:.4f}"
                     )
 
+                    # Log to experiment tracker
+                    if self.experiment_tracker:
+                        self.experiment_tracker.log_metrics(metrics, step=self.global_step)
+
                 # Save checkpoint
-                if self.global_step % self.config.save_steps == 0:
+                if did_step and self.global_step % self.config.save_steps == 0:
                     self._save_checkpoint()
 
         logger.info("Training completed!")
+
+        # Finalize experiment tracking
+        if self.experiment_tracker:
+            # Log final metrics
+            final_metrics = {
+                "final_best_reward": self.best_reward,
+                "final_global_step": self.global_step,
+            }
+            self.experiment_tracker.log_metrics(final_metrics)
+
+            # Log model
+            self.experiment_tracker.log_model(
+                self.config.output_dir,
+                name="grpo_model_final",
+                model_type="huggingface"
+            )
+
+            self.experiment_tracker.finish(status="FINISHED")
 
     def _collate_fn(self, batch: List[Dict]) -> Dict[str, Any]:
         """Collate function for dataloader."""
         prompt_ids = [item["prompt_input_ids"] for item in batch]
         prompt_mask = [item["prompt_attention_mask"] for item in batch]
+        target_poi = [item.get("target_poi", "") for item in batch]
 
         return {
             "prompt_input_ids": torch.nn.utils.rnn.pad_sequence(
@@ -606,6 +846,7 @@ class GRPOTrainer:
                 padding_value=0,
             ),
             "metadata": [item["metadata"] for item in batch],
+            "target_poi": target_poi,
         }
 
     def _save_checkpoint(self):
@@ -623,13 +864,23 @@ class GRPOTrainer:
         self.tokenizer.save_pretrained(output_dir)
 
         # Save config
-        with open(output_dir / "grpo_config.json", "w") as f:
+        config_path = output_dir / "grpo_config.json"
+        with open(config_path, "w") as f:
             json.dump({
                 "global_step": self.global_step,
                 "best_reward": self.best_reward,
             }, f, indent=2)
 
         logger.info(f"Checkpoint saved to {output_dir}")
+
+        # Log to experiment tracker (only on first checkpoint)
+        if self.experiment_tracker and self.global_step == self.config.save_steps:
+            self.experiment_tracker.log_model(
+                str(output_dir),
+                name="grpo_model",
+                model_type="huggingface"
+            )
+            self.experiment_tracker.log_artifact(str(config_path))
 
 
 def main():
