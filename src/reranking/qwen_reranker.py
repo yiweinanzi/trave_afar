@@ -5,10 +5,14 @@ Qwen3 Reranker
 参考: models/download.md
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 pipe = pipeline("text-generation", model="Qwen/Qwen3-Reranker-4B")
+
+包含自动重试机制和详细错误日志
 """
 import os
+import time
+import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable, Any
 
 try:
     import torch
@@ -24,27 +28,71 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# 设置日志
+logger = logging.getLogger(__name__)
+
+
+def retry_on_failure(
+    max_retries: int = 3,
+    delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    exceptions: Tuple = (Exception,),
+    on_retry: Optional[Callable[[int, Exception], None]] = None
+):
+    """
+    装饰器：在函数执行失败时自动重试，支持指数退避
+    """
+    def decorator(func: Callable) -> Callable:
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = delay
+
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning("{} 失败 (尝试 {}/{}): {}".format(
+                            func.__name__, attempt + 1, max_retries, e
+                        ))
+                        if on_retry:
+                            on_retry(attempt + 1, e)
+                        logger.info("等待 {:.1f} 秒后重试...".format(current_delay))
+                        time.sleep(current_delay)
+                        current_delay *= backoff_factor
+                    else:
+                        logger.error("{} 在 {} 次尝试后仍然失败".format(
+                            func.__name__, max_retries
+                        ))
+                        logger.error("最后错误: {}".format(e))
+                        logger.debug("错误详情:", exc_info=True)
+            raise last_exception
+        return wrapper
+    return decorator
+
 
 class QwenReranker:
     """
     Qwen3 Reranker
     使用Qwen3-Reranker-4B对候选POI进行精排
-
-    用法:
-        reranker = QwenReranker(model_path="models/Qwen3-Reranker-4B")
-        ranked_pois = reranker.rerank(query, candidates, topk=20)
+    包含自动重试机制和详细错误日志
     """
 
-    def __init__(self, model_path: Optional[str] = None, use_gpu: bool = True):
-        """
-        初始化Reranker
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        use_gpu: bool = True,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        retry_backoff: float = 2.0
+    ):
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
 
-        Args:
-            model_path: 模型路径，默认为models/Qwen3-Reranker-4B
-            use_gpu: 是否使用GPU
-        """
         if torch is None:
-            print("torch未安装，Reranker将使用规则回退")
+            logger.warning("torch未安装，Reranker将使用规则回退")
             self.model = None
             self.tokenizer = None
             self.use_gpu = False
@@ -55,48 +103,95 @@ class QwenReranker:
         self.device = "cuda" if self.use_gpu else "cpu"
 
         if AutoModelForSequenceClassification is None:
-            print("transformers未安装，Reranker将使用规则回退")
+            logger.warning("transformers未安装，Reranker将使用规则回退")
             self.model = None
             self.tokenizer = None
             return
 
         # 解析模型路径
         if model_path is None:
-            model_path = os.getenv("GOAFAR_RERANKER_MODEL", str(PROJECT_ROOT / "models/Qwen3-Reranker-4B"))
+            model_path = os.getenv(
+                "GOAFAR_RERANKER_MODEL",
+                str(PROJECT_ROOT / "models/Qwen3-Reranker-4B")
+            )
 
         if not Path(model_path).exists():
-            print(f"模型路径不存在: {model_path}")
-            print("Reranker将使用规则回退")
+            logger.warning("模型路径不存在: {}".format(model_path))
+            logger.warning("Reranker将使用规则回退")
             self.model = None
             self.tokenizer = None
             return
 
-        try:
-            print(f"加载Qwen3-Reranker-4B: {model_path}")
-            print(f"设备: {self.device}")
+        # 使用重试机制加载模型
+        self._load_model_with_retry(model_path)
 
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
+    def _load_model_with_retry(self, model_path: str):
+        """带重试机制的模型加载"""
+        last_exception = None
+        current_delay = self.retry_delay
 
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                torch_dtype=torch.float16 if self.use_gpu else torch.float32
-            )
+        for attempt in range(self.max_retries):
+            try:
+                logger.info("加载Qwen3-Reranker-4B: {}".format(model_path))
+                logger.info("设备: {}".format(self.device))
 
-            if self.use_gpu:
-                self.model = self.model.to(self.device)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    trust_remote_code=True
+                )
 
-            self.model.eval()
-            print("✓ Reranker模型加载完成")
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16 if self.use_gpu else torch.float32
+                )
 
-        except Exception as e:
-            print(f"Reranker模型加载失败: {e}")
-            print("将使用规则回退")
-            self.model = None
-            self.tokenizer = None
+                if self.use_gpu:
+                    self.model = self.model.to(self.device)
+
+                self.model.eval()
+                logger.info("Reranker模型加载完成")
+                return
+
+            except Exception as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    logger.warning("模型加载失败 (尝试 {}/{}): {}".format(
+                        attempt + 1, self.max_retries, e
+                    ))
+                    logger.info("等待 {:.1f} 秒后重试...".format(current_delay))
+                    time.sleep(current_delay)
+                    current_delay *= self.retry_backoff
+                else:
+                    logger.error("模型加载在 {} 次尝试后仍然失败".format(
+                        self.max_retries
+                    ))
+                    logger.error("最后错误: {}".format(e))
+                    logger.debug("错误详情:", exc_info=True)
+
+        # 所有重试都失败
+        logger.warning("将使用规则回退")
+        self.model = None
+        self.tokenizer = None
+
+    def is_available(self) -> bool:
+        """检查模型是否可用"""
+        return self.model is not None
+
+    def get_device(self) -> str:
+        """获取当前使用的设备"""
+        return self.device
+
+    @staticmethod
+    def _safe_text(value: Any) -> str:
+        """将候选字段安全转换为字符串，屏蔽 None/NaN。"""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, float) and value != value:  # NaN
+            return ""
+        return str(value)
 
     def rerank(
         self,
@@ -105,24 +200,12 @@ class QwenReranker:
         topk: int = 20,
         score_key: str = "score"
     ) -> List[Dict]:
-        """
-        对候选POI进行重排序
-
-        Args:
-            query: 用户查询
-            candidates: 候选POI列表，每个元素为字典，包含name, description等字段
-            topk: 返回Top-K
-            score_key: 原始分数字段名
-
-        Returns:
-            重排序后的候选列表
-        """
+        """对候选POI进行重排序（带重试）"""
         if self.model is None or len(candidates) <= topk:
             return self._rule_based_rerank(query, candidates, topk)
 
-        # 批量计算分数
         try:
-            scores = self._compute_scores(query, candidates)
+            scores = self._compute_scores_with_retry(query, candidates)
 
             # 更新分数并排序
             for i, candidate in enumerate(candidates):
@@ -133,21 +216,38 @@ class QwenReranker:
             return ranked[:topk]
 
         except Exception as e:
-            print(f"Reranker计算失败: {e}")
+            logger.error("Reranker计算失败: {}".format(e))
+            logger.debug("使用规则回退", exc_info=True)
             return self._rule_based_rerank(query, candidates, topk)
 
+    def _compute_scores_with_retry(self, query: str, candidates: List[Dict]) -> List[float]:
+        """带重试机制的分数计算"""
+        last_exception = None
+        current_delay = self.retry_delay
+
+        for attempt in range(self.max_retries):
+            try:
+                return self._compute_scores(query, candidates)
+            except (RuntimeError, OSError) as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    logger.warning("分数计算失败 (尝试 {}/{}): {}".format(
+                        attempt + 1, self.max_retries, e
+                    ))
+                    logger.info("等待 {:.1f} 秒后重试...".format(current_delay))
+                    time.sleep(current_delay)
+                    current_delay *= self.retry_backoff
+                else:
+                    logger.error("分数计算在 {} 次尝试后仍然失败".format(
+                        self.max_retries
+                    ))
+
+        # 如果所有重试都失败，返回默认分数
+        logger.warning("所有重试失败，返回默认分数")
+        return [0.0] * len(candidates)
+
     def _compute_scores(self, query: str, candidates: List[Dict], batch_size: int = 8) -> List[float]:
-        """
-        计算query-candidate对的分数（支持批量推理）
-
-        Args:
-            query: 用户查询
-            candidates: 候选POI列表
-            batch_size: 批量大小
-
-        Returns:
-            相关性分数列表
-        """
+        """计算query-candidate对的分数（支持批量推理）"""
         if self.model is None:
             return [0.0] * len(candidates)
 
@@ -162,11 +262,13 @@ class QwenReranker:
             # 构建批量输入
             prompts = []
             for candidate in batch_candidates:
-                name = candidate.get("name", "")
-                desc = candidate.get("description", "")[:200]
-                city = candidate.get("city", "")
-                province = candidate.get("province", "")
-                prompt = f"查询：{query}\n景点：{name}（{city}，{province}）\n描述：{desc}"
+                name = self._safe_text(candidate.get("name", ""))
+                desc = self._safe_text(candidate.get("description", ""))[:200]
+                city = self._safe_text(candidate.get("city", ""))
+                province = self._safe_text(candidate.get("province", ""))
+                prompt = "查询：{}\n景点：{}（{}，{}）\n描述：{}".format(
+                    query, name, city, province, desc
+                )
                 prompts.append(prompt)
 
             # Tokenize（批量）
@@ -184,7 +286,6 @@ class QwenReranker:
                 if hasattr(outputs, "logits"):
                     logits = outputs.logits
                     if logits.dim() > 1:
-                        # 取第一个logit作为相关性分数
                         batch_scores = logits[:, 0].cpu().tolist()
                     else:
                         batch_scores = [logits[0].item()]
@@ -197,15 +298,14 @@ class QwenReranker:
 
     def _rule_based_rerank(self, query: str, candidates: List[Dict], topk: int) -> List[Dict]:
         """规则回退方案"""
-        # 简单关键词匹配
-        query_lower = query.lower()
+        query_lower = self._safe_text(query).lower()
 
         for candidate in candidates:
             score = 0.0
-            name = candidate.get("name", "").lower()
-            desc = candidate.get("description", "").lower()
-            city = candidate.get("city", "").lower()
-            province = candidate.get("province", "").lower()
+            name = self._safe_text(candidate.get("name", "")).lower()
+            desc = self._safe_text(candidate.get("description", "")).lower()
+            city = self._safe_text(candidate.get("city", "")).lower()
+            province = self._safe_text(candidate.get("province", "")).lower()
 
             # 关键词匹配
             for keyword in query_lower.split():
@@ -223,57 +323,58 @@ class QwenReranker:
         return sorted(candidates, key=lambda x: x.get("reranker_score", 0), reverse=True)[:topk]
 
     def compute_pairwise_score(self, query: str, doc: str) -> float:
-        """
-        计算query-doc对的分数（单个）
-
-        Args:
-            query: 查询文本
-            doc: 文档文本
-
-        Returns:
-            相关性分数
-        """
+        """计算query-doc对的分数（单个，带重试）"""
         if self.model is None:
-            # 简单关键词匹配
-            query_words = set(query.lower().split())
-            doc_words = set(doc.lower().split())
+            query_words = set(self._safe_text(query).lower().split())
+            doc_words = set(self._safe_text(doc).lower().split())
             overlap = len(query_words & doc_words)
             return float(overlap) / max(len(query_words), 1)
 
-        try:
-            prompt = f"查询：{query}\n文��：{doc}"
+        last_exception = None
+        current_delay = self.retry_delay
 
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512
-            ).to(self.device)
+        for attempt in range(self.max_retries):
+            try:
+                prompt = "查询：{}\n文档：{}".format(query, doc)
 
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                logits = outputs.logits
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512
+                ).to(self.device)
 
-                if logits.dim() > 1:
-                    return logits[0, 0].item()
-                return logits[0].item()
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
 
-        except Exception as e:
-            print(f"分数计算失败: {e}")
-            return 0.0
+                    if logits.dim() > 1:
+                        return logits[0, 0].item()
+                    return logits[0].item()
+
+            except (RuntimeError, OSError) as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:
+                    logger.warning("成对分数计算失败 (尝试 {}/{}): {}".format(
+                        attempt + 1, self.max_retries, e
+                    ))
+                    time.sleep(current_delay)
+                    current_delay *= self.retry_backoff
+                else:
+                    logger.error("成对分数计算在 {} 次尝试后仍然失败".format(
+                        self.max_retries
+                    ))
+                    break
+
+        # Fallback
+        logger.warning("使用关键词匹配作为fallback")
+        query_words = set(self._safe_text(query).lower().split())
+        doc_words = set(self._safe_text(doc).lower().split())
+        overlap = len(query_words & doc_words)
+        return float(overlap) / max(len(query_words), 1)
 
     def compute_batch_pairwise_scores(self, query: str, docs: List[str], batch_size: int = 8) -> List[float]:
-        """
-        批量计算query-doc对的分数
-
-        Args:
-            query: 查询文本
-            docs: 文档文本列表
-            batch_size: 批量大小
-
-        Returns:
-            相关性分数列表
-        """
+        """批量计算query-doc对的分数（带重试）"""
         if self.model is None:
             return [self.compute_pairwise_score(query, doc) for doc in docs]
 
@@ -286,31 +387,62 @@ class QwenReranker:
             batch_docs = docs[start_idx:end_idx]
 
             # 构建批量输入
-            prompts = [f"查询：{query}\n文档：{doc}" for doc in batch_docs]
+            prompts = ["查询：{}\n文档：{}".format(query, doc) for doc in batch_docs]
 
-            inputs = self.tokenizer(
-                prompts,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-                padding=True
-            ).to(self.device)
+            try:
+                inputs = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding=True
+                ).to(self.device)
 
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                logits = outputs.logits
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
 
-                if logits.dim() > 1:
-                    batch_scores = logits[:, 0].cpu().tolist()
-                else:
-                    batch_scores = [logits[0].item()]
+                    if logits.dim() > 1:
+                        batch_scores = logits[:, 0].cpu().tolist()
+                    else:
+                        batch_scores = [logits[0].item()]
 
-                scores.extend(batch_scores)
+                    scores.extend(batch_scores)
+
+            except Exception as e:
+                logger.warning("批量计算失败，使用fallback: {}".format(e))
+                for doc in batch_docs:
+                    scores.append(self.compute_pairwise_score(query, doc))
 
         return scores
 
+    def cleanup(self):
+        """清理模型资源"""
+        if self.model is not None:
+            if self.use_gpu and hasattr(self.model, 'to'):
+                try:
+                    self.model.to('cpu')
+                except Exception:
+                    pass
+            del self.model
+            self.model = None
+
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+
+        # 清理GPU缓存
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        import gc
+        gc.collect()
+
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     print("=" * 60)
     print("测试 Qwen3 Reranker")
     print("=" * 60)
@@ -326,9 +458,11 @@ if __name__ == "__main__":
     ]
 
     reranker = QwenReranker(use_gpu=False)
+    print("Reranker可用: {}".format(reranker.is_available()))
+
     ranked = reranker.rerank(query, candidates, topk=4)
 
     print("\n重排序结果:")
     for i, item in enumerate(ranked, 1):
         score = item.get("reranker_score", 0)
-        print(f"{i}. {item['name']} - {item['province']} - 分数: {score:.2f}")
+        print("{}. {} - {} - 分数: {:.2f}".format(i, item['name'], item['province'], score))

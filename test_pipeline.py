@@ -15,14 +15,14 @@ def test_step1_data():
     
     from data_processing.sql_extractor import parse_go_address_sql
     
-    if not os.path.exists('data/poi.csv'):
+    if not os.path.exists('data/all/poi_expanded.csv'):
         print("提取SQL数据...")
         parse_go_address_sql()
     else:
-        print("✓ 数据已存在: data/poi.csv")
+        print("✓ 数据已存在: data/all/poi_expanded.csv")
     
     import pandas as pd
-    df = pd.read_csv('data/poi.csv')
+    df = pd.read_csv('data/all/poi_expanded.csv')
     print(f"\n数据统计:")
     print(f"  景点总数: {len(df)}")
     print(f"  省份数: {df['province'].nunique()}")
@@ -42,11 +42,11 @@ def test_step2_embedding():
     from pathlib import Path
     
     # 只测试前10个POI
-    df = pd.read_csv('data/poi.csv').head(10)
+    df = pd.read_csv('data/all/poi_expanded.csv').head(10)
     
     print(f"测试 {len(df)} 个 POI...")
     
-    model_path = os.getenv("GOAFAR_BGE_MODEL", "models/Xorbits/bge-m3")
+    model_path = os.getenv("GOAFAR_QWEN3_EMBEDDING_MODEL", "models/Qwen3-Embedding-4B")
     model_path = str((Path(__file__).resolve().parent / model_path).resolve())
     encoder = BGEM3Encoder(model_path=model_path, use_gpu=False)
     
@@ -144,7 +144,7 @@ def test_step5_routing():
     import pandas as pd
     
     # 使用前10个POI测试
-    df = pd.read_csv('data/poi.csv')
+    df = pd.read_csv('data/all/poi_expanded.csv')
     test_pois = df[df['province'] == '新疆'].head(10)
     
     print(f"测试 {len(test_pois)} 个新疆景点...")

@@ -46,16 +46,25 @@ class LLMGenerator:
             if self.model_path:
                 model_path = self.model_path
             else:
-                # 检查本地模型路径
                 project_root = Path(__file__).resolve().parents[2]
                 model_dir_env = os.getenv("GOAFAR_QWEN_MODEL_DIR", "")
-                local_model_path = model_dir_env or str(project_root / "models/models--Qwen--Qwen3-8B")
-                if os.path.exists(local_model_path):
-                    model_path = local_model_path
-                    print(f"使用本地模型: {model_path}")
+                candidates = []
+                if model_dir_env:
+                    candidates.append(Path(model_dir_env))
+                candidates.append(project_root / "models" / "Qwen3-8B")
+                candidates.append(project_root / "models" / "models--Qwen--Qwen3-8B")
+
+                model_path = None
+                for path in candidates:
+                    if path.exists():
+                        model_path = str(path)
+                        break
+
+                if model_path is None:
+                    model_path = str(project_root / "models" / "Qwen3-8B")
+                    print(f"⚠️ 未找到可用本地模型目录，按默认路径尝试: {model_path}")
                 else:
-                    # 回退到HuggingFace模型名称
-                    model_path = "Qwen/Qwen3-8B"
+                    print(f"使用本地模型: {model_path}")
 
             cache_root = os.getenv("GOAFAR_MODEL_CACHE")
             if not cache_root:

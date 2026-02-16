@@ -124,7 +124,7 @@ def test_recbole_data_export():
         from recommendation.recbole_trainer import export_recbole_data
 
         # 检查数据文件是否存在
-        events_csv = "data/user_events.csv"
+        events_csv = "data/all/user_events.csv"
         if not Path(events_csv).exists():
             print(f"\n⚠️ 用户事件文件不存在: {events_csv}")
             print("  跳过数据导出测试")

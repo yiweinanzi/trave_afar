@@ -12,7 +12,7 @@ Wikidata数据增强器 - 完整版
 
 使用方法:
     # 增强现有POI
-    python src/data_processing/wikidata_enricher_full.py enrich --input data/poi.csv --output data/poi_enriched.csv
+    python src/data_processing/wikidata_enricher_full.py enrich --input data/all/poi_expanded.csv --output data/all/poi_enriched.csv
 
     # 扩展省份
     python src/data_processing/wikidata_enricher_full.py expand --provinces 新疆 四川 浙江 --topk 500

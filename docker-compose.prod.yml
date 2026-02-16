@@ -1,0 +1,64 @@
+# =============================================================================
+# GoAfar 生产环境 Docker Compose 覆盖配置
+# =============================================================================
+# 用法:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# =============================================================================
+
+version: "3.8"
+
+services:
+  goafar:
+    build:
+      context: .
+      target: production
+    environment:
+      # 生产环���配置
+      - GOAFAR_ENV_MODE=prod
+      - GOAFAR_LOG_LEVEL=WARNING
+      - GOAFAR_API_PORT=8000
+      - GOAFAR_CORS_ORIGINS=${GOAFAR_CORS_ORIGINS}
+      - GOAFAR_RATE_LIMIT_ENABLED=true
+      - GOAFAR_RATE_LIMIT_REQUESTS=100
+      - GOAFAR_API_KEY_REQUIRED=${GOAFAR_API_KEY_REQUIRED:-true}
+      - GOAFAR_LLM_GPU=${GOAFAR_LLM_GPU:-true}
+      - GOAFAR_PROM_ENABLED=true
+
+    # 生产环境不挂载源代码
+    volumes:
+      - ./data:/app/data:ro
+      - ./models:/app/models:ro
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+      - ./configs:/app/configs:ro
+      # 不挂载 ./src
+
+    # 多实例部署
+    deploy:
+      replicas: ${GOAFAR_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+    restart: always
+
+  prometheus:
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus_rules.yml:/etc/prometheus/prometheus_rules.yml:ro
+      - prometheus-data:/prometheus
+    restart: always
+
+  grafana:
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
+      - GF_INSTALL_PLUGINS=
+      - TZ=Asia/Shanghai
+    restart: always

@@ -1,9 +1,10 @@
 """
-准备数据：从原始景点Excel转换为标准格式的 poi.csv 和模拟的 user_events.csv
+准备数据：从原始景点Excel转换为标准格式的 POI 数据和模拟的用户事件数据。
 """
 import pandas as pd
 import numpy as np
 import random
+import os
 from datetime import datetime, timedelta
 
 # 新疆各区域中心大致坐标（用于生成模拟经纬度）
@@ -21,7 +22,7 @@ REGION_COORDS = {
     '跨区域': (87.6168, 43.8256),  # 默认乌鲁木齐
 }
 
-def prepare_poi_data(source_path='data/poi_source.xlsx', output_path='data/poi.csv'):
+def prepare_poi_data(source_path='data/poi_source.xlsx', output_path='data/all/poi_expanded.csv'):
     """
     将原始景点数据转换为标准格式
     poi_id,name,lat,lon,open_min,close_min,stay_min,city,description,landscapes,activities
@@ -78,11 +79,14 @@ def prepare_poi_data(source_path='data/poi_source.xlsx', output_path='data/poi.c
         })
     
     poi_df = pd.DataFrame(poi_data)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     poi_df.to_csv(output_path, index=False, encoding='utf-8')
     print(f"✓ 生成 POI 数据: {output_path}, 共 {len(poi_df)} 个景点")
     return poi_df
 
-def generate_user_events(poi_df, output_path='data/user_events.csv', 
+def generate_user_events(poi_df, output_path='data/all/user_events.csv',
                          num_users=500, events_per_user_range=(5, 30)):
     """
     生成模拟的用户行为数据
@@ -126,13 +130,16 @@ def generate_user_events(poi_df, output_path='data/user_events.csv',
     
     events_df = pd.DataFrame(events)
     events_df = events_df.sort_values(['user_id', 'timestamp'])
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     events_df.to_csv(output_path, index=False)
     print(f"✓ 生成用户事件数据: {output_path}, 共 {len(events_df)} 条记录")
     return events_df
 
 if __name__ == "__main__":
     import os
-    os.makedirs('data', exist_ok=True)
+    os.makedirs('data/all', exist_ok=True)
     
     # 准备 POI 数据
     poi_df = prepare_poi_data()
@@ -145,4 +152,3 @@ if __name__ == "__main__":
     print(events_df.head(10))
     
     print("\n✓ 数据准备完成！")
-

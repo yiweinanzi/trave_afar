@@ -34,10 +34,10 @@ def load_model(model_path: str, base_model: str = None):
         tokenizer.pad_token = tokenizer.eos_token
 
     # 加载模型
-    if Path(model_path / "adapter_config.json").exists():
+    if (Path(model_path) / "adapter_config.json").exists():
         # LoRA模型
         print("检测到LoRA适配器，加载base模型...")
-        base_model_path = base_model or "Qwen/Qwen3-8B"
+        base_model_path = base_model or str(MODEL_CACHE_DIR / "Qwen3-8B")
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
             trust_remote_code=True,

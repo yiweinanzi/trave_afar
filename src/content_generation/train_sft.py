@@ -34,7 +34,7 @@ from transformers import (
     TrainingArguments,
     BitsAndBytesConfig,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
 # 添加src到路径
@@ -111,9 +111,28 @@ def load_sft_data(data_path: str, allow_sample_data: bool = False) -> Dataset:
     if "response" not in df.columns and "completion" not in df.columns:
         raise ValueError("数据必须包含 response 或 completion 列")
 
-    # 统一使用response字段
-    if "response" not in df.columns and "completion" in df.columns:
-        df["response"] = df["completion"]
+    # 统一使用response字段，并兼容 response/completion 混合存在的情况
+    if "response" not in df.columns:
+        df["response"] = None
+
+    if "completion" in df.columns:
+        response_missing = df["response"].isna() | (df["response"].astype(str).str.strip() == "")
+        df.loc[response_missing, "response"] = df.loc[response_missing, "completion"]
+
+    # 清理字段，移除空样本，避免出现字符串 "nan" 参与训练
+    df["prompt"] = df["prompt"].fillna("").astype(str)
+    df["response"] = df["response"].fillna("").astype(str)
+    df.loc[df["prompt"].str.lower() == "nan", "prompt"] = ""
+    df.loc[df["response"].str.lower() == "nan", "response"] = ""
+
+    valid_mask = (df["prompt"].str.strip() != "") & (df["response"].str.strip() != "")
+    dropped = int((~valid_mask).sum())
+    if dropped > 0:
+        print(f"⚠️ 清理无效SFT样本: {dropped} 条")
+    df = df.loc[valid_mask].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("清理后无可用SFT样本，请检查数据集字段内容")
 
     print(f"✓ 加载SFT数据: {len(df)} 条")
     return Dataset.from_pandas(df)
@@ -196,6 +215,7 @@ def train_sft(
     num_train_epochs: int = 3,
     per_device_train_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
+    max_grad_norm: float = 0.3,
     max_seq_length: int = 512,
     use_gpu: bool = True,
     allow_sample_data: bool = False,
@@ -219,6 +239,7 @@ def train_sft(
         num_train_epochs: 训练轮数
         per_device_train_batch_size: 每设备批次大小
         gradient_accumulation_steps: 梯度累积步数
+        max_grad_norm: 梯度裁剪阈值
         max_seq_length: 最大序列长度
         use_gpu: 是否使用GPU
         use_mlflow: 是否启用MLflow实验追踪
@@ -297,6 +318,7 @@ def train_sft(
             "num_train_epochs": num_train_epochs,
             "per_device_train_batch_size": per_device_train_batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
+            "max_grad_norm": max_grad_norm,
             "max_seq_length": max_seq_length,
             "device": device,
         }
@@ -332,31 +354,31 @@ def train_sft(
         **model_kwargs
     )
 
-    # LoRA配置
+    # LoRA配置（与是否启用4-bit量化解耦）
     peft_config = None
-    if use_qlora:
-        print(f"\n配置LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
-        peft_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
+    print(f"\n配置LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+    peft_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
 
-        # 准备k-bit训练
+    # 仅在4-bit量化实际启用时执行k-bit准备
+    # LoRA适配器由SFTTrainer根据peft_config注入
+    if bnb_config is not None:
         model = prepare_model_for_kbit_training(model)
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
 
     # SFT配置
     sft_config = SFTConfig(
         output_dir=output_dir,
-        max_seq_length=max_seq_length,
+        max_length=max_seq_length,
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        max_grad_norm=max_grad_norm,
         learning_rate=learning_rate,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
@@ -375,8 +397,17 @@ def train_sft(
         """格式化训练样本"""
         texts = []
         for prompt, response in zip(examples["prompt"], examples["response"]):
-            # Qwen聊天格式
-            text = f"<|im_start|>system\n你是一位专业的旅游规划助手。<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{response}<|im_end|>"
+            # 使用tokenizer原生chat template，避免手工模板与模型配置不一致
+            messages = [
+                {"role": "system", "content": "你是一位专业的旅游规划助手。"},
+                {"role": "user", "content": str(prompt)},
+                {"role": "assistant", "content": str(response)},
+            ]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
             texts.append(text)
         return {"text": texts}
 
@@ -388,7 +419,7 @@ def train_sft(
         model=model,
         args=sft_config,
         train_dataset=formatted_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         peft_config=peft_config,
     )
 
@@ -433,6 +464,7 @@ def train_sft(
             "num_train_epochs": num_train_epochs,
             "per_device_train_batch_size": per_device_train_batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
+            "max_grad_norm": max_grad_norm,
             "max_seq_length": max_seq_length,
         }
         with open(config_path, 'w', encoding='utf-8') as f:
@@ -462,6 +494,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=3, help='训练轮数')
     parser.add_argument('--batch-size', type=int, default=2, help='批次大小')
     parser.add_argument('--grad-accum', type=int, default=4, help='梯度累积步数')
+    parser.add_argument('--max-grad-norm', type=float, default=0.3, help='梯度裁剪阈值')
     parser.add_argument('--max-length', type=int, default=512, help='最大序列长度')
     parser.add_argument('--no-gpu', action='store_true', help='不使用GPU')
     parser.add_argument('--allow-sample-data', action='store_true', help='缺失训练数据时允许回退到内置示例数据')
@@ -480,6 +513,7 @@ if __name__ == "__main__":
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
+        max_grad_norm=args.max_grad_norm,
         max_seq_length=args.max_length,
         use_gpu=not args.no_gpu,
         allow_sample_data=args.allow_sample_data,

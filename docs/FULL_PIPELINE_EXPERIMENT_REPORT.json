@@ -1,0 +1,283 @@
+{
+  "timestamp": "2026-02-16T12:54:19.570394",
+  "data_check": {
+    "poi_emb": {
+      "exists": true,
+      "shape": [
+        1333,
+        2560
+      ],
+      "size_mb": 13.0177001953125
+    },
+    "poi_meta": {
+      "exists": true,
+      "rows": 1333,
+      "columns": [
+        "poi_id",
+        "name",
+        "lat",
+        "lon",
+        "open_min",
+        "close_min",
+        "stay_min",
+        "province",
+        "city",
+        "description",
+        "time_str",
+        "airport",
+        "osm_id",
+        "code",
+        "fclass",
+        "population"
+      ]
+    },
+    "time_matrix": {
+      "exists": true,
+      "size_mb": 0.00164794921875
+    },
+    "poi_data": {
+      "exists": true,
+      "rows": 1333,
+      "provinces": 8
+    }
+  },
+  "stages": {
+    "initialization": {
+      "success": true,
+      "duration_seconds": 0.08249974250793457,
+      "model_health": {
+        "embedding": true,
+        "reranker": true,
+        "llm": true,
+        "all": true
+      }
+    }
+  },
+  "performance": {
+    "memory": {
+      "rss_mb": 5337.76953125,
+      "vms_mb": 77346.16015625
+    },
+    "latency": {
+      "mean": 28.70068844159444,
+      "std": 0.06147297529209002,
+      "min": 28.620341062545776,
+      "max": 28.769613027572632,
+      "samples": [
+        28.769613027572632,
+        28.712111234664917,
+        28.620341062545776
+      ]
+    }
+  },
+  "recommendations": [
+    {
+      "test_name": "基础模板模式",
+      "request": {
+        "query": "想去新疆看7天雪山和草原，拍照",
+        "city": "新疆",
+        "days": 7,
+        "budget": 5000,
+        "group_type": "朋友",
+        "interests": [
+          "自然",
+          "摄影"
+        ],
+        "use_llm": false
+      },
+      "stage_times": {
+        "intent_understanding": 0,
+        "recall": 0,
+        "reranking": 0,
+        "total": 35.641489028930664
+      },
+      "success": true,
+      "error": null,
+      "response": {
+        "title": "天山南北｜东天山-哈密市区-巴里坤草原，牧歌悠扬",
+        "description": "根据您的需求「想去新疆看7天雪山和草原，拍照」为您精心规划了这条新疆深度游路线。行程涵盖2个精选景点，预计用时4.9小时。沿途将游览巴里坤草原等知名景点。让您在有限的时间内，领略新疆最精华的风景，体验最地道的文化。",
+        "total_hours": 4.854444444444445,
+        "num_pois": 2,
+        "province": "新疆",
+        "route": [
+          {
+            "name": "东天山",
+            "duration_minutes": 150,
+            "poi_id": "1201"
+          },
+          {
+            "name": "哈密市区",
+            "duration_minutes": 60,
+            "poi_id": "1322"
+          },
+          {
+            "name": "巴里坤草原",
+            "duration_minutes": 180,
+            "poi_id": "1316"
+          },
+          {
+            "name": "东天山",
+            "duration_minutes": 0,
+            "poi_id": "1201"
+          }
+        ],
+        "debug": {
+          "recall_sources": {
+            "dense": 48,
+            "behavior": 47,
+            "geo": 40
+          },
+          "candidate_count_before_rerank": 80,
+          "candidate_count_after_rerank": 20,
+          "matrix_provider": "osrm",
+          "fallback_events": [
+            "training_embedding_mismatch:2134",
+            "qwen_reranker_applied"
+          ]
+        }
+      }
+    },
+    {
+      "test_name": "LLM增强模式",
+      "request": {
+        "query": "想去云南看古镇和自然风光，5天行程",
+        "city": "云南",
+        "days": 5,
+        "budget": 3000,
+        "group_type": "情侣",
+        "interests": [
+          "文化",
+          "自然"
+        ],
+        "use_llm": true
+      },
+      "stage_times": {
+        "intent_understanding": 0,
+        "recall": 0,
+        "reranking": 0,
+        "total": 49.25712609291077
+      },
+      "success": true,
+      "error": null,
+      "response": {
+        "title": "彩云之南｜双廊古镇-大理古城-才村码头，寻古探今",
+        "description": "根据您的需求「想去云南看古镇和自然风光，5天行程」为您精心规划了这条云南深度游路线。行程涵盖4个精选景点，预计用时6.8小时。让您在有限的时间内，领略云南最精华的风景，体验最地道的文化。",
+        "total_hours": 6.826388888888889,
+        "num_pois": 4,
+        "province": "云南",
+        "route": [
+          {
+            "name": "双廊古镇",
+            "duration_minutes": 120,
+            "poi_id": "3015"
+          },
+          {
+            "name": "大理古城",
+            "duration_minutes": 90,
+            "poi_id": "3011"
+          },
+          {
+            "name": "才村码头",
+            "duration_minutes": 120,
+            "poi_id": "3019"
+          },
+          {
+            "name": "磻溪村s弯",
+            "duration_minutes": 120,
+            "poi_id": "3012"
+          },
+          {
+            "name": "廊桥",
+            "duration_minutes": 150,
+            "poi_id": "3020"
+          },
+          {
+            "name": "双廊古镇",
+            "duration_minutes": 0,
+            "poi_id": "3015"
+          }
+        ],
+        "debug": {
+          "recall_sources": {
+            "dense": 62,
+            "behavior": 0,
+            "geo": 40
+          },
+          "candidate_count_before_rerank": 80,
+          "candidate_count_after_rerank": 20,
+          "matrix_provider": "osrm",
+          "fallback_events": [
+            "training_embedding_mismatch:2134",
+            "qwen_reranker_applied"
+          ]
+        }
+      }
+    },
+    {
+      "test_name": "甘肃短途游",
+      "request": {
+        "query": "甘肃周末两日游，历史文化景点",
+        "city": "甘肃",
+        "days": 2,
+        "budget": 2000,
+        "group_type": "家庭",
+        "interests": [
+          "历史",
+          "文化"
+        ],
+        "use_llm": false
+      },
+      "stage_times": {
+        "intent_understanding": 0,
+        "recall": 0,
+        "reranking": 0,
+        "total": 29.115688800811768
+      },
+      "success": true,
+      "error": null,
+      "response": {
+        "title": "河西走廊｜敦煌文化遗址-敦煌博物馆-敦煌市区，探索未知之美",
+        "description": "根据您的需求「甘肃周末两日游，历史文化景点」为您精心规划了这条甘肃深度游路线。行程涵盖2个精选景点，预计用时4.4小时。让您在有限的时间内，领略甘肃最精华的风景，体验最地道的文化。",
+        "total_hours": 4.404166666666667,
+        "num_pois": 2,
+        "province": "甘肃",
+        "route": [
+          {
+            "name": "敦煌文化遗址",
+            "duration_minutes": 150,
+            "poi_id": "5009"
+          },
+          {
+            "name": "敦煌博物馆",
+            "duration_minutes": 90,
+            "poi_id": "5008"
+          },
+          {
+            "name": "敦煌市区",
+            "duration_minutes": 60,
+            "poi_id": "5035"
+          },
+          {
+            "name": "敦煌文化遗址",
+            "duration_minutes": 0,
+            "poi_id": "5009"
+          }
+        ],
+        "debug": {
+          "recall_sources": {
+            "dense": 60,
+            "behavior": 0,
+            "geo": 40
+          },
+          "candidate_count_before_rerank": 80,
+          "candidate_count_after_rerank": 30,
+          "matrix_provider": "osrm",
+          "fallback_events": [
+            "training_embedding_mismatch:2134",
+            "qwen_reranker_failed:'float' object has no attribute 'lower'"
+          ]
+        }
+      }
+    }
+  ]
+}

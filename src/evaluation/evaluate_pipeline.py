@@ -34,13 +34,28 @@ def load_test_queries(csv_path: str = None) -> List[Dict]:
     if csv_path and Path(csv_path).exists():
         df = pd.read_csv(csv_path)
         queries = []
+
+        def _split_cell(value) -> List[str]:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return []
+            text = str(value).strip()
+            if not text:
+                return []
+            return [part.strip() for part in text.split(",") if part.strip()]
+
         for _, row in df.iterrows():
+            days_val = row.get("days", 3)
+            try:
+                days = int(float(days_val)) if not pd.isna(days_val) else 3
+            except Exception:
+                days = 3
+
             queries.append({
                 "query": row.get("query", ""),
                 "province": row.get("province", ""),
-                "days": int(row.get("days", 3)),
-                "interests": row.get("interests", "").split(",") if row.get("interests") else [],
-                "ground_truth_pois": row.get("ground_truth_pois", "").split(",") if row.get("ground_truth_pois") else []
+                "days": days,
+                "interests": _split_cell(row.get("interests", "")),
+                "ground_truth_pois": _split_cell(row.get("ground_truth_pois", "")),
             })
         return queries
 

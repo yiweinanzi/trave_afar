@@ -8,9 +8,12 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
-from utils.id_mapping import normalize_poi_id
+try:
+    from src.utils.id_mapping import normalize_poi_id
+except ImportError:
+    from utils.id_mapping import normalize_poi_id
 
-def export_recbole_data(events_csv='data/user_events.csv',
+def export_recbole_data(events_csv='data/all/user_events.csv',
                        output_dir='outputs/recbole/custom'):
     """
     导出RecBole格式的交互数据
@@ -28,7 +31,7 @@ def export_recbole_data(events_csv='data/user_events.csv',
     df = pd.read_csv(events_csv)
     df['poi_id'] = df['poi_id'].apply(normalize_poi_id)
 
-    poi_csv = 'data/poi.csv'
+    poi_csv = 'data/all/poi_expanded.csv'
     if os.path.exists(poi_csv):
         poi_df = pd.read_csv(poi_csv)
         poi_df['poi_id'] = poi_df['poi_id'].apply(normalize_poi_id)
@@ -233,7 +236,7 @@ class RecBoleProvider:
         """预加载降级所需的数据"""
         try:
             # 加载用户事件数据
-            events_csv = "data/user_events.csv"
+            events_csv = "data/all/user_events.csv"
             if os.path.exists(events_csv):
                 events = pd.read_csv(events_csv)
                 events['poi_id'] = events['poi_id'].apply(normalize_poi_id)

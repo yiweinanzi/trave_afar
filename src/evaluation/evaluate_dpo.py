@@ -56,7 +56,7 @@ class DPOModelEvaluator:
             config_path = Path(self.model_path) / "adapter_config.json"
             with open(config_path) as f:
                 adapter_config = json.load(f)
-            base_model_path = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-8B")
+            base_model_path = adapter_config.get("base_model_name_or_path", "models/Qwen3-8B")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,

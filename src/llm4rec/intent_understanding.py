@@ -145,6 +145,16 @@ class IntentUnderstandingModule:
     
     def _llm_understanding(self, query):
         """基于LLM的意图理解"""
+        # 优先复用Qwen推荐器的意图接口（内置JSON抽取与回退逻辑）
+        if hasattr(self.llm_model, "understand_intent"):
+            try:
+                result = self.llm_model.understand_intent(query)
+                if isinstance(result, dict):
+                    return self._normalize_intent_result(result, query)
+            except Exception as e:
+                print(f"LLM意图理解失败，回退到模板: {e}")
+                return self._template_understanding(query)
+
         prompt = f"""请分析以下用户的旅游需求，提取关键信息：
 
 用户查询：{query}
@@ -161,14 +171,14 @@ class IntentUnderstandingModule:
 - implicit_needs: 隐含需求（推断出的未明说的需求）
 
 只返回JSON，不要其他文字。"""
-        
+
         try:
             # 调用LLM
             response = self._call_llm(prompt)
-            result = json.loads(response)
-            result['original_query'] = query
-            result['expanded_query'] = self._expand_query(result)
-            return result
+            payload = self._extract_json_payload(response)
+            if not isinstance(payload, dict):
+                raise ValueError("未解析到JSON对象")
+            return self._normalize_intent_result(payload, query)
         except Exception as e:
             print(f"LLM意图理解失败，回退到模板: {e}")
             return self._template_understanding(query)
@@ -183,23 +193,27 @@ class IntentUnderstandingModule:
             # 如果llm_model是LLMGenerator实例
             if hasattr(self.llm_model, 'tokenizer') and hasattr(self.llm_model, 'model'):
                 messages = [
-                    {"role": "system", "content": "你是专业的旅游规划助手"},
+                    {"role": "system", "content": "你是专业的旅游规划助手。严格只输出可解析JSON，不要输出解释、代码块或<think>标签。"},
                     {"role": "user", "content": prompt}
                 ]
-                
+
                 text = self.llm_model.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True
                 )
-                
-                model_inputs = self.llm_model.tokenizer([text], return_tensors="pt").to(self.llm_model.model.device)
-                
+
+                model_inputs = self.llm_model.tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=3072,
+                ).to(self.llm_model.model.device)
+
                 generated_ids = self.llm_model.model.generate(
                     **model_inputs,
-                    max_new_tokens=200,
-                    temperature=0.3,
-                    do_sample=True
+                    max_new_tokens=160,
+                    do_sample=False,
                 )
                 
                 generated_ids = [
@@ -233,6 +247,70 @@ class IntentUnderstandingModule:
                 
         except Exception as e:
             raise RuntimeError(f"LLM调用失败: {e}")
+
+    @staticmethod
+    def _extract_json_payload(text):
+        """从LLM输出中提取首个可解析JSON（支持<think>/代码块包装）。"""
+        if text is None:
+            return None
+
+        cleaned = str(text).strip()
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(cleaned):
+            if ch not in "{[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(cleaned[i:])
+                return obj
+            except Exception:
+                continue
+        return None
+
+    def _normalize_intent_result(self, result, query):
+        """统一不同LLM输出字段，保证下游字段完整。"""
+        normalized = dict(result or {})
+        normalized["original_query"] = query
+
+        if not normalized.get("season_preference") and normalized.get("season"):
+            normalized["season_preference"] = normalized.get("season")
+        if not normalized.get("travel_style") and normalized.get("style"):
+            normalized["travel_style"] = normalized.get("style")
+
+        for key in ("cities", "interests", "activities", "constraints"):
+            value = normalized.get(key)
+            if value is None:
+                normalized[key] = []
+            elif isinstance(value, str):
+                normalized[key] = [value] if value.strip() else []
+            elif not isinstance(value, list):
+                normalized[key] = list(value) if value else []
+
+        if normalized.get("duration_days") is not None:
+            try:
+                normalized["duration_days"] = int(float(normalized["duration_days"]))
+            except Exception:
+                normalized["duration_days"] = None
+
+        if not normalized.get("expanded_query"):
+            keywords = normalized.get("keywords")
+            if isinstance(keywords, list) and keywords:
+                normalized["expanded_query"] = " ".join(str(k) for k in keywords if str(k).strip())
+            if not normalized.get("expanded_query"):
+                normalized["expanded_query"] = self._expand_query(normalized)
+
+        if not normalized.get("travel_style"):
+            normalized["travel_style"] = "观光游"
+
+        return normalized
     
     def _expand_query(self, intent_result):
         """基于意图结果扩展查询"""
@@ -268,4 +346,3 @@ if __name__ == "__main__":
         print(f"\n查询: {query}")
         result = module.understand(query)
         print(f"结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
-

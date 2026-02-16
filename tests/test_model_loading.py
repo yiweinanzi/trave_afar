@@ -18,6 +18,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import argparse
 import logging
 
+# 该文件是手工脚本，不作为 pytest 用例收集
+__test__ = False
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -48,7 +51,7 @@ def check_model_files(model_path: Path) -> dict:
 
     # 检查tokenizer
     tokenizer_files = ['tokenizer.json', 'vocab.json', 'merges.txt']
-    result['tokenizer_exists'] = all((model_path / f).exists() for f in tokenizer_files if (model_path / f).exists())
+    result['tokenizer_exists'] = all((model_path / f).exists() for f in tokenizer_files)
 
     # 检查模型文件
     for ext in ['.safetensors', '.bin', '.pth']:

@@ -84,7 +84,7 @@ def test_data_export():
     print("=" * 60)
 
     try:
-        events_csv = "data/user_events.csv"
+        events_csv = "data/all/user_events.csv"
         if not Path(events_csv).exists():
             print(f"\n⚠️ 用户事件文件不存在: {events_csv}")
             return

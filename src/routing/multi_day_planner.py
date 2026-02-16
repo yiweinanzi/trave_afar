@@ -147,7 +147,7 @@ if __name__ == "__main__":
     print("="*60)
     
     # 构造测试候选
-    test_candidates = pd.read_csv('data/poi.csv')
+    test_candidates = pd.read_csv('data/all/poi_expanded.csv')
     xinjiang_pois = test_candidates[test_candidates['province'] == '新疆'].head(30)
     
     planner = MultiDayPlanner()
@@ -171,4 +171,3 @@ if __name__ == "__main__":
         print(f"  景点:")
         for stop in day_plan['route'][1:-1]:
             print(f"    - {stop['poi_name']}")
-

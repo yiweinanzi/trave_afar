@@ -809,6 +809,8 @@ class GRPOTrainer:
                     self._save_checkpoint()
 
         logger.info("Training completed!")
+        # 始终保存最终权重，避免 save_steps 未触发时输出目录不存在
+        self._save_checkpoint()
 
         # Finalize experiment tracking
         if self.experiment_tracker:
@@ -898,9 +900,15 @@ def main():
                         help="Output directory")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=4,
+                        help="Gradient accumulation steps")
     parser.add_argument("--group-size", type=int, default=4,
                         help="Number of samples per prompt for GRPO")
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--max-new-tokens", type=int, default=256,
+                        help="Maximum generated tokens per sampled response")
+    parser.add_argument("--logging-steps", type=int, default=10,
+                        help="Log metrics every N optimization steps")
     parser.add_argument("--use-lora", action="store_true", default=True,
                         help="Use LoRA for efficient training")
     parser.add_argument("--no-lora", dest="use_lora", action="store_false",
@@ -920,8 +928,11 @@ def main():
         output_dir=args.output,
         num_train_epochs=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         group_size=args.group_size,
         learning_rate=args.lr,
+        max_new_tokens=args.max_new_tokens,
+        logging_steps=args.logging_steps,
         use_lora=args.use_lora,
     )
 

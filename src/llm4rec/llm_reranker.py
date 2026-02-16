@@ -4,6 +4,7 @@ LLM Reranker - 候选重排序
 """
 import pandas as pd
 import json
+import re
 
 class LLMReranker:
     """LLM重排序器"""
@@ -116,17 +117,47 @@ class LLMReranker:
     def _llm_based_rerank(self, candidates_df, user_intent, topk):
         """
         基于LLM的重排序
-        
+
         使用LLM理解候选POI与用户意图的匹配度
         """
+        # 优先复用Qwen推荐器内置重排序，减少重复实现与解析失败
+        if hasattr(self.llm_model, "rerank_pois"):
+            try:
+                candidate_slice = candidates_df.head(min(15, len(candidates_df)))
+                pois = []
+                for _, row in candidate_slice.iterrows():
+                    poi_id = row.get("poi_id")
+                    if not poi_id:
+                        continue
+                    pois.append({
+                        "poi_id": poi_id,
+                        "name": self._safe_text(row.get("name"), max_len=80),
+                        "city": self._safe_text(row.get("city"), max_len=40),
+                        "description": self._safe_text(row.get("description"), max_len=80),
+                    })
+
+                ranked_poi_ids = self.llm_model.rerank_pois(
+                    pois=pois,
+                    user_intent=user_intent,
+                    topk=min(topk, len(pois)),
+                )
+                reranked = self._reorder_by_poi_ids(candidates_df, ranked_poi_ids, topk)
+                if reranked is not None:
+                    return reranked
+            except Exception as e:
+                print(f"Qwen重排序接口失败: {e}")
+
         # 构建prompt
+        max_candidates = min(20, len(candidates_df))
         candidates_info = []
-        for idx, row in candidates_df.head(50).iterrows():  # 限制LLM处理数量
+        candidate_slice = candidates_df.head(max_candidates).copy()
+        candidate_index = candidate_slice.index.tolist()
+        for pos, (_, row) in enumerate(candidate_slice.iterrows()):  # 限制LLM处理数量
             candidates_info.append({
-                'id': idx,
-                'name': row['name'],
-                'city': row['city'],
-                'description': row['description'][:100] if pd.notna(row['description']) else ''
+                'id': pos,
+                'name': self._safe_text(row.get('name'), max_len=80),
+                'city': self._safe_text(row.get('city'), max_len=40),
+                'description': self._safe_text(row.get('description'), max_len=60),
             })
         
         prompt = f"""用户需求：{user_intent['original_query']}
@@ -136,19 +167,43 @@ class LLMReranker:
 - 活动：{', '.join(user_intent.get('activities', []))}
 - 风格：{user_intent.get('travel_style', '观光游')}
 
-候选景点（前50个）：
+候选景点（前{len(candidates_info)}个）：
 {json.dumps(candidates_info, ensure_ascii=False, indent=2)}
 
 请根据用户意图对以上景点重新排序，返回最相关的{topk}个景点的ID列表。
-只返回JSON格式的ID列表：[id1, id2, ...]"""
+只返回JSON对象：{{"ranked_ids": [id1, id2, ...]}}。不要输出解释、代码块或<think>。"""
         
         try:
             response = self._call_llm(prompt)
-            ranked_ids = json.loads(response)
-            
-            # 按LLM排序结果重排
-            reranked = candidates_df.loc[ranked_ids].copy()
+            payload = self._extract_json_payload(response)
+            if isinstance(payload, dict):
+                raw_ids = payload.get("ranked_ids", [])
+            elif isinstance(payload, list):
+                raw_ids = payload
+            else:
+                raise ValueError("未解析到有效JSON")
+
+            ranked_pos = []
+            seen = set()
+            for item in raw_ids:
+                try:
+                    pos = int(item)
+                except Exception:
+                    continue
+                if 0 <= pos < len(candidate_index) and pos not in seen:
+                    ranked_pos.append(pos)
+                    seen.add(pos)
+
+            if not ranked_pos:
+                raise ValueError("LLM未返回有效ID列表")
+
+            ranked_index = [candidate_index[p] for p in ranked_pos]
+            reranked = candidates_df.loc[ranked_index].copy()
             reranked['llm_rank'] = range(1, len(reranked) + 1)
+
+            if len(reranked) < topk:
+                tail = candidates_df.drop(index=reranked.index, errors="ignore").head(topk - len(reranked))
+                reranked = pd.concat([reranked, tail], axis=0)
             
             return reranked.head(topk)
             
@@ -167,7 +222,7 @@ class LLMReranker:
             # 如果llm_model是LLMGenerator实例
             if hasattr(self.llm_model, 'tokenizer') and hasattr(self.llm_model, 'model'):
                 messages = [
-                    {"role": "system", "content": "你是专业的旅游推荐助手"},
+                    {"role": "system", "content": "你是专业的旅游推荐助手。严格只输出可解析JSON，不要输出解释、代码块或<think>标签。"},
                     {"role": "user", "content": prompt}
                 ]
                 
@@ -177,15 +232,37 @@ class LLMReranker:
                     add_generation_prompt=True
                 )
                 
-                model_inputs = self.llm_model.tokenizer([text], return_tensors="pt").to(self.llm_model.model.device)
+                model_inputs = self.llm_model.tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=3072,
+                ).to(self.llm_model.model.device)
+
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 
-                generated_ids = self.llm_model.model.generate(
-                    **model_inputs,
-                    max_new_tokens=300,
-                    temperature=0.3,
-                    do_sample=True
-                )
-                
+                try:
+                    generated_ids = self.llm_model.model.generate(
+                        **model_inputs,
+                        max_new_tokens=120,
+                        do_sample=False,
+                    )
+                except RuntimeError as e:
+                    # 避免一次OOM后持续碎片化
+                    if "out of memory" in str(e).lower():
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    raise
+
                 generated_ids = [
                     output_ids[len(input_ids):] 
                     for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -217,6 +294,61 @@ class LLMReranker:
                 
         except Exception as e:
             raise RuntimeError(f"LLM调用失败: {e}")
+
+    @staticmethod
+    def _safe_text(value, max_len=None):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            text = ""
+        else:
+            text = str(value)
+        text = re.sub(r"\s+", " ", text).strip()
+        if max_len is not None:
+            return text[:max_len]
+        return text
+
+    @staticmethod
+    def _extract_json_payload(text):
+        if text is None:
+            return None
+        cleaned = str(text).strip()
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(cleaned):
+            if ch not in "{[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(cleaned[i:])
+                return obj
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _reorder_by_poi_ids(candidates_df, ranked_poi_ids, topk):
+        if not ranked_poi_ids or "poi_id" not in candidates_df.columns:
+            return None
+
+        rank_map = {poi_id: idx for idx, poi_id in enumerate(ranked_poi_ids)}
+        reranked = candidates_df[candidates_df["poi_id"].isin(rank_map)].copy()
+        if reranked.empty:
+            return None
+
+        reranked["llm_rank"] = reranked["poi_id"].map(rank_map)
+        reranked = reranked.sort_values("llm_rank", ascending=True)
+
+        if len(reranked) < topk:
+            tail = candidates_df[~candidates_df["poi_id"].isin(reranked["poi_id"])].head(topk - len(reranked))
+            reranked = pd.concat([reranked, tail], axis=0)
+
+        return reranked.head(topk)
 
 if __name__ == "__main__":
     # 测试
@@ -256,4 +388,3 @@ if __name__ == "__main__":
     
     print(f"\n重排序结果 Top 10:")
     print(reranked[['name', 'city', 'rerank_score']].to_string(index=False))
-

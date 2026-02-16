@@ -15,8 +15,12 @@ from urllib.request import urlopen
 import numpy as np
 import pandas as pd
 
-from utils.cache_manager import CacheManager
-from utils.id_mapping import normalize_poi_id
+try:
+    from src.utils.cache_manager import CacheManager
+    from src.utils.id_mapping import normalize_poi_id
+except ImportError:
+    from utils.cache_manager import CacheManager
+    from utils.id_mapping import normalize_poi_id
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -169,7 +173,7 @@ def _cache_key(provider: str, osrm_url: str, avg_speed_kmh: float, poi_ids: Sequ
 
 
 def build_time_matrix(
-    poi_csv: str = "data/poi.csv",
+    poi_csv: str = "data/all/poi_with_coords.csv",
     output_path: str = "outputs/routing/time_matrix.npy",
     avg_speed_kmh: float = 60,
     poi_ids: Optional[Sequence[str]] = None,
@@ -191,13 +195,24 @@ def build_time_matrix(
     output_file = _resolve_path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    poi_df = pd.read_csv(_resolve_path(poi_csv))
+    poi_df = pd.read_csv(_resolve_path(poi_csv), low_memory=False)
     poi_df["poi_id"] = poi_df["poi_id"].apply(normalize_poi_id)
     poi_df = _filter_pois(poi_df, poi_ids=poi_ids)
 
+    # 坐标清洗：避免 NaN/非法值在距离计算阶段触发 int(NaN) 异常
+    for col in ("lat", "lon"):
+        poi_df[col] = pd.to_numeric(poi_df[col], errors="coerce")
+    invalid_coord = poi_df["lat"].isna() | poi_df["lon"].isna()
+    if invalid_coord.any():
+        dropped = poi_df.loc[invalid_coord, "poi_id"].astype(str).tolist()
+        preview = dropped[:5]
+        suffix = "..." if len(dropped) > 5 else ""
+        print(f"⚠️ 跳过 {len(dropped)} 个坐标缺失POI: {preview}{suffix}")
+        poi_df = poi_df.loc[~invalid_coord].reset_index(drop=True)
+
     n = len(poi_df)
     if n == 0:
-        raise ValueError("POI数据为空，无法构建时间矩阵")
+        raise ValueError("POI数据为空或坐标无效，无法构建时间矩阵")
 
     print(f"构建时间矩阵: {n}x{n}")
     print(f"provider: {provider}")

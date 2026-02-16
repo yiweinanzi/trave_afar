@@ -18,8 +18,8 @@ echo ""
 # 默认参数
 POI_CSV="data/all/poi_expanded.csv"
 OUTPUT_DIR="outputs/emb"
-MODEL_PATH="models/Xorbits/bge-m3"
-MODEL_TYPE="bge_m3"
+MODEL_PATH="models/Qwen3-Embedding-4B"
+MODEL_TYPE="qwen3"
 BATCH_SIZE=128
 USE_GPU=true
 

@@ -24,6 +24,13 @@ from .metrics import (
     diversity_score,
     novelty_score
 )
+from .metrics_advanced import (
+    precision_at_k,
+    mean_reciprocal_rank,
+    mean_average_precision,
+    BusinessMetricsEvaluator,
+    MetricsComparison,
+)
 
 
 class PipelineEvaluator:
@@ -45,6 +52,7 @@ class PipelineEvaluator:
         self.retriever = None
         self.reranker = None
         self.planner = None
+        self.llm_model = None
 
         # 评测结果存储
         self.results = []
@@ -59,27 +67,61 @@ class PipelineEvaluator:
         Args:
             use_llm: 是否使用LLM模式
         """
-        print("初始化推荐系统���块...")
+        print("初始化推荐系统模块...")
+
+        llm_model = None
+        effective_use_llm = use_llm
+        if use_llm:
+            try:
+                from src.llm4rec.qwen_recommender import QwenRecommender
+                from src.service.config import load_runtime_config
+
+                runtime_cfg = load_runtime_config()
+                lora_path = None
+                if runtime_cfg.llm.use_lora and runtime_cfg.llm.lora_path:
+                    lora_path = str(runtime_cfg.resolve_path(runtime_cfg.llm.lora_path))
+
+                llm_model = QwenRecommender(
+                    model_name_or_path=runtime_cfg.llm.qwen_model,
+                    use_gpu=runtime_cfg.llm.use_gpu,
+                    use_lora=runtime_cfg.llm.use_lora,
+                    lora_path=lora_path,
+                )
+                if llm_model.model is None:
+                    effective_use_llm = False
+                    print("  ⚠ LLM加载失败，回退模板模式")
+                else:
+                    print("  ✓ Qwen模型加载完成")
+            except Exception as exc:
+                effective_use_llm = False
+                print(f"  ⚠ LLM初始化失败，回退模板模式: {exc}")
 
         # 1. 意图理解
         from src.llm4rec.intent_understanding import IntentUnderstandingModule
-        self.intent_module = IntentUnderstandingModule(use_template=not use_llm)
+        self.intent_module = IntentUnderstandingModule(
+            llm_model=llm_model,
+            use_template=not effective_use_llm,
+        )
         print("  ✓ 意图理解模块")
 
         # 2. 召回
-        from src.recommendation.candidate_merger import CandidateMerger
-        self.retriever = CandidateMerger()
+        from src.recommendation.candidate_merger import merge_candidates
+        self.retriever = merge_candidates
         print("  ✓ 候选召回模块")
 
         # 3. 重排序
         from src.llm4rec.llm_reranker import LLMReranker
-        self.reranker = LLMReranker(use_template=not use_llm)
+        self.reranker = LLMReranker(
+            llm_model=llm_model,
+            use_template=not effective_use_llm,
+        )
         print("  ✓ 重排序模块")
 
         # 4. 路线规划
         from src.routing.vrptw_solver import VRPTWSolver
         self.planner = VRPTWSolver
         print("  ✓ 路线规划模块")
+        self.llm_model = llm_model
 
     def evaluate_query(
         self,
@@ -128,19 +170,40 @@ class PipelineEvaluator:
                 )
                 result["recall_contributions"] = contributions
             else:
-                candidates = self.retriever.merge_candidates(
-                    intent=intent,
-                    top_k=80
+                recall_query = (
+                    intent.get("expanded_query")
+                    or intent.get("original_query")
+                    or query.get("query", "")
+                )
+                candidates = self.retriever(
+                    query_text=recall_query,
+                    topk_dense=80,
+                    topk_seq=30,
+                    topk_geo=30,
+                    province_filter=query.get("province"),
                 )
 
             recall_time = time.time() - recall_start
             result["num_candidates"] = len(candidates)
 
+            if len(candidates) == 0:
+                total_time = time.time() - start_time
+                result["error"] = "未找到匹配的候选景点"
+                result["latency"] = total_time
+                result["latency_breakdown"] = {
+                    "intent": intent_time,
+                    "recall": recall_time,
+                    "rerank": 0.0,
+                    "plan": 0.0,
+                    "total": total_time,
+                }
+                return result
+
             # 3. 重排序
             rerank_start = time.time()
             final_pois = self.reranker.rerank(
-                candidates=candidates,
-                intent=intent,
+                candidates_df=candidates,
+                user_intent=intent,
                 topk=30
             )
             rerank_time = time.time() - rerank_start
@@ -151,31 +214,46 @@ class PipelineEvaluator:
                 from src.routing.time_matrix_builder import build_time_matrix
 
                 plan_start = time.time()
-                selected_pois = final_pois.head(min(20, len(final_pois)))
+                selected_pool = final_pois
+                if {"lat", "lon"}.issubset(final_pois.columns):
+                    lat = pd.to_numeric(final_pois["lat"], errors="coerce")
+                    lon = pd.to_numeric(final_pois["lon"], errors="coerce")
+                    valid_coord = lat.notna() & lon.notna()
+                    dropped = int((~valid_coord).sum())
+                    if dropped > 0:
+                        result["planning_filtered_out"] = dropped
+                    selected_pool = final_pois.loc[valid_coord]
 
-                try:
-                    time_matrix, poi_df = build_time_matrix(
-                        poi_ids=selected_pois['poi_id'].tolist(),
-                        use_cache=True
-                    )
+                selected_pois = selected_pool.head(min(20, len(selected_pool)))
 
-                    solver = self.planner(poi_df, time_matrix)
-                    solution = solver.solve(
-                        max_duration_hours=10,
-                        time_limit_seconds=30
-                    )
-
-                    if solution:
-                        result["route_feasible"] = True
-                        result["route_hours"] = solution.get("total_hours", 0)
-                        result["num_visited"] = solution.get("visited_pois", 0)
-                    else:
-                        result["route_feasible"] = False
-
+                if len(selected_pois) < 3:
                     plan_time = time.time() - plan_start
-                except Exception as e:
-                    plan_time = time.time() - plan_start
-                    result["route_error"] = str(e)
+                    result["route_feasible"] = False
+                    result["route_error"] = "候选POI坐标缺失，无法构建路线"
+                else:
+                    try:
+                        time_matrix, poi_df = build_time_matrix(
+                            poi_ids=selected_pois['poi_id'].tolist(),
+                            use_cache=True
+                        )
+
+                        solver = self.planner(poi_df, time_matrix)
+                        solution = solver.solve(
+                            max_duration_hours=10,
+                            time_limit_seconds=30
+                        )
+
+                        if solution:
+                            result["route_feasible"] = True
+                            result["route_hours"] = solution.get("total_hours", solution.get("total_time_hours", 0))
+                            result["num_visited"] = solution.get("visited_pois", 0)
+                        else:
+                            result["route_feasible"] = False
+
+                        plan_time = time.time() - plan_start
+                    except Exception as e:
+                        plan_time = time.time() - plan_start
+                        result["route_error"] = str(e)
             else:
                 plan_time = 0
                 result["route_feasible"] = False
@@ -218,20 +296,30 @@ class PipelineEvaluator:
 
         # 这里简化处理，实际应该修改merge_candidates返回各路贡献
         # 目前先返回基本的合并结果
+        recall_query = (
+            intent.get("expanded_query")
+            or intent.get("original_query")
+            or ""
+        )
         candidates = merge_candidates(
-            query_text=intent.get("query", ""),
+            query_text=recall_query,
             topk_dense=top_k,
             topk_seq=30,
             topk_geo=30,
             province_filter=province
         )
 
-        # 模拟各路召回贡献（实际应该从召回模块获取）
+        def _count_flag(column: str) -> int:
+            if column not in candidates.columns:
+                return 0
+            values = pd.to_numeric(candidates[column], errors="coerce").fillna(0)
+            return int(values.sum())
+
         contributions = {
-            "semantic": len(candidates) * 0.55,  # 语义召回贡献
-            "behavior": len(candidates) * 0.30,  # 行为召回贡献
-            "geo": len(candidates) * 0.15,       # 地理召回贡献
-            "total": len(candidates)
+            "semantic": _count_flag("from_dense"),
+            "behavior": _count_flag("from_behavior"),
+            "geo": _count_flag("from_geo"),
+            "total": int(len(candidates))
         }
 
         return candidates, contributions
@@ -390,7 +478,10 @@ class PipelineEvaluator:
         ground_truth: List[List[str]],
         item_attributes: Optional[Dict[str, Dict]] = None,
         item_popularity: Optional[Dict[str, float]] = None,
-        k_values: List[int] = [5, 10, 20]
+        k_values: List[int] = [5, 10, 20],
+        click_labels: Optional[List[List[int]]] = None,
+        visit_labels: Optional[List[List[int]]] = None,
+        predicted_probs: Optional[List[List[float]]] = None,
     ) -> Dict[str, float]:
         """
         计算推荐质量指标
@@ -401,6 +492,9 @@ class PipelineEvaluator:
             item_attributes: 物品属性（用于多样性）
             item_popularity: 物品流行度（用于新颖性）
             k_values: K值列表
+            click_labels: 点击标签（用于CTR AUC）
+            visit_labels: 访问标签（用于Visit AUC）
+            predicted_probs: 预测概率（用于校准）
 
         Returns:
             指标字典
@@ -415,6 +509,12 @@ class PipelineEvaluator:
             ]
             metrics[f"recall@{k}"] = np.mean(recalls)
 
+            precisions = [
+                precision_at_k(pred, truth, k)
+                for pred, truth in zip(predictions, ground_truth)
+            ]
+            metrics[f"precision@{k}"] = np.mean(precisions)
+
             ndcgs = [
                 ndcg_at_k(pred, truth, k)
                 for pred, truth in zip(predictions, ground_truth)
@@ -427,6 +527,19 @@ class PipelineEvaluator:
             ]
             metrics[f"hitrate@{k}"] = np.mean(hit_rates)
 
+        # MRR and MAP
+        mrrs = [
+            mean_reciprocal_rank(pred, truth)
+            for pred, truth in zip(predictions, ground_truth)
+        ]
+        metrics["mrr"] = np.mean(mrrs)
+
+        maps = [
+            mean_average_precision(pred, truth)
+            for pred, truth in zip(predictions, ground_truth)
+        ]
+        metrics["map"] = np.mean(maps)
+
         # 多样性
         if item_attributes is not None:
             metrics["diversity"] = diversity_score(predictions, item_attributes)
@@ -434,6 +547,25 @@ class PipelineEvaluator:
         # 新颖性
         if item_popularity is not None:
             metrics["novelty"] = novelty_score(predictions, item_popularity, k=10)
+
+        # 业务指标
+        if click_labels is not None:
+            business_eval = BusinessMetricsEvaluator()
+            for pred, clicks in zip(predictions, click_labels):
+                if clicks:
+                    b_metrics = business_eval.evaluate(
+                        click_labels=clicks,
+                        predictions=pred
+                    )
+                    for key, val in b_metrics.items():
+                        if key not in metrics:
+                            metrics[key] = []
+                        metrics[key].append(val)
+
+            # Average business metrics
+            for key in list(metrics.keys()):
+                if isinstance(metrics[key], list):
+                    metrics[key] = np.mean(metrics[key])
 
         return metrics
 

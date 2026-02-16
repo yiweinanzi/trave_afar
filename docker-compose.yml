@@ -1,0 +1,220 @@
+# =============================================================================
+# GoAfar Docker Compose 配置
+# =============================================================================
+# 用法:
+#   开发环境: docker-compose up
+#   生产环境: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # =============================================================================
+  # 主应用服务
+  # =============================================================================
+  goafar:
+    build:
+      context: .
+      target: development
+    container_name: goafar-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 环境配置
+      - GOAFAR_ENV_MODE=${GOAFAR_ENV_MODE:-dev}
+      - GOAFAR_INSTANCE_ID=${GOAFAR_INSTANCE_ID:-goafar-1}
+      - GOAFAR_LOG_LEVEL=${GOAFAR_LOG_LEVEL:-INFO}
+
+      # API配置
+      - GOAFAR_API_HOST=0.0.0.0
+      - GOAFAR_API_PORT=8000
+      - GOAFAR_CORS_ORIGINS=*
+
+      # LLM配置
+      - GOAFAR_LLM_ENABLED=${GOAFAR_LLM_ENABLED:-true}
+      - GOAFAR_LLM_GPU=${GOAFAR_LLM_GPU:-true}
+      - GOAFAR_LLM_MODEL=${GOAFAR_LLM_MODEL:-models/Qwen3-8B}
+
+      # 监控配置
+      - GOAFAR_PROM_ENABLED=${GOAFAR_PROM_ENABLED:-true}
+      - GOAFAR_PROM_PORT=9090
+    volumes:
+      # 挂载数据目录
+      - ./data:/app/data:ro
+      - ./models:/app/models:ro
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+
+      # 挂载配置（支持热重载）
+      - ./configs:/app/configs:ro
+
+      # 挂载源代码（开发模式热重载）
+      - ./src:/app/src
+
+    networks:
+      - goafar-network
+
+    # GPU支持（需要nvidia-docker）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    restart: unless-stopped
+
+    depends_on:
+      - prometheus
+      - grafana
+
+  # =============================================================================
+  # Prometheus 监控
+  # =============================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: goafar-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - goafar-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # Grafana 可视化
+  # =============================================================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: goafar-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - goafar-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # Redis (可选，用于缓存)
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: goafar-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - goafar-network
+    restart: unless-stopped
+    profiles:
+      - cache  # 使用 --profile cache 启用
+
+  # =============================================================================
+  # MLflow (可选，用于实验追踪)
+  # =============================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.0
+    container_name: goafar-mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      - BACKEND_STORE=postgresql://mlflow:mlflow@postgres/mlflow
+      - DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - goafar-network
+    restart: unless-stopped
+    profiles:
+      - mlops  # 使用 --profile mlops 启用
+
+  # =============================================================================
+  # PostgreSQL (MLflow依赖)
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: goafar-postgres
+    environment:
+      - POSTGRES_USER=mlflow
+      - POSTGRES_PASSWORD=mlflow
+      - POSTGRES_DB=mlflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - goafar-network
+    restart: unless-stopped
+    profiles:
+      - mlops
+
+  # =============================================================================
+  # Jaeger (可选，用于分布式追踪)
+  # =============================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: goafar-jaeger
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"
+      - "14250:14250"
+      - "9411:9411"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - goafar-network
+    restart: unless-stopped
+    profiles:
+      - tracing  # 使用 --profile tracing 启用
+
+
+# =============================================================================
+# 网络配置
+# =============================================================================
+networks:
+  goafar-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+
+# =============================================================================
+# 数据卷配置
+# =============================================================================
+volumes:
+  prometheus-data:
+  grafana-data:
+  redis-data:
+  mlflow-data:
+  postgres-data:

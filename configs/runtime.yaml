@@ -1,10 +1,47 @@
+# =============================================================================
+# GoAfar 统一运行时配置
+# 支持环境变量覆盖: GOAFAR_{SECTION}_{KEY}
+# 例如: GOAFAR_LLM_USE_GPU=false
+# =============================================================================
+
+# 环境配置
+environment:
+  # 环境类型: dev, staging, prod
+  mode: ${GOAFAR_ENV_MODE:dev}
+  # 实例ID (用于分布式部署)
+  instance_id: ${GOAFAR_INSTANCE_ID:goafar-1}
+  # 区域/可用区
+  region: ${GOAFAR_REGION:default}
+
 runtime:
   seed: 2026
-  log_level: INFO
+  log_level: ${GOAFAR_LOG_LEVEL:INFO}
+  # 工作进程数 (0=CPU核心数)
+  workers: ${GOAFAR_WORKERS:0}
+  # 请求超时时间(秒)
+  request_timeout: ${GOAFAR_REQUEST_TIMEOUT:300}
+  # 启用性能分析
+  profiling: ${GOAFAR_PROFILING:false}
+
+# API服务配置
+api:
+  host: ${GOAFAR_API_HOST:0.0.0.0}
+  port: ${GOAFAR_API_PORT:8000}
+  # CORS配置
+  cors_origins: ${GOAFAR_CORS_ORIGINS:*}
+  cors_methods: ${GOAFAR_CORS_METHODS:GET,POST,OPTIONS}
+  cors_headers: ${GOAFAR_CORS_HEADERS:*}
+  # 限流配置
+  rate_limit_enabled: ${GOAFAR_RATE_LIMIT_ENABLED:false}
+  rate_limit_requests: ${GOAFAR_RATE_LIMIT_REQUESTS:100}
+  rate_limit_window: ${GOAFAR_RATE_LIMIT_WINDOW:60}
+  # API密钥验证
+  api_key_required: ${GOAFAR_API_KEY_REQUIRED:false}
+  api_key_header: ${GOAFAR_API_KEY_HEADER:X-API-Key}
 
 paths:
-  poi_csv: data/poi.csv
-  user_events_csv: data/user_events.csv
+  poi_csv: data/all/poi_with_coords.csv
+  user_events_csv: data/all/user_events.csv
   emb_dir: outputs/emb
   routing_dir: outputs/routing
   cache_dir: outputs/cache
@@ -13,23 +50,27 @@ paths:
   yelp_dir: data/external/yelp
   geolife_dir: data/external/Geolife Trajectories 1.3
 
-# Qwen3系列模型配置（HF Mirror下载）
+# Qwen3系列模型配置
 models:
   qwen_8b: models/Qwen3-8B
   qwen_embedding: models/Qwen3-Embedding-4B
   qwen_reranker: models/Qwen3-Reranker-4B
-  bge_m3: models/Xorbits/bge-m3
+  bge_m3: models/Qwen3-Embedding-4B
   # 微调后的模型路径
   sft_model: outputs/sft/qwen3-8b-tourism
   dpo_model: outputs/dpo/qwen3-8b-dpo
 
 embedding:
-  model_path: models/Qwen3-Embedding-4B  # 使用Qwen3-Embedding-4B
-  fallback_model: models/Xorbits/bge-m3  # 回退到BGE-M3
-  use_gpu: true
-  auto_build_if_missing: true
-  backend: auto
+  model_path: ${GOAFAR_EMBEDDING_MODEL:models/Qwen3-Embedding-4B}
+  fallback_model: ${GOAFAR_EMBEDDING_FALLBACK:models/Qwen3-Embedding-4B}
+  use_gpu: ${GOAFAR_EMBEDDING_GPU:true}
+  auto_build_if_missing: ${GOAFAR_EMBEDDING_AUTO_BUILD:true}
+  backend: ${GOAFAR_EMBEDDING_BACKEND:auto}
   faiss_index_file: outputs/emb/poi_faiss.index
+  # 批处理配置
+  batch_size: ${GOAFAR_EMBEDDING_BATCH_SIZE:32}
+  # 模型量化 (4bit, 8bit, none)
+  quantization: ${GOAFAR_EMBEDDING_QUANT:none}
 
 recall:
   semantic_topk: 80
@@ -44,25 +85,23 @@ recall:
   calibrate: minmax
 
   # RecBole 行为召回配置
-  behavior_provider: popularity  # 可选: popularity, recbole
-  recbole_model_path: outputs/recbole/saved  # RecBole 模型路径
-  recbole_config: configs/recbole.yaml  # RecBole 配置文件
-  recbole_use_gpu: true  # RecBole 是否使用 GPU
-
-  # 动态权重融合
-  adaptive_fusion: false  # 是否启用动态权重融合（根据用户历史长度调整）
+  behavior_provider: popularity
+  recbole_model_path: outputs/recbole/saved
+  recbole_config: configs/recbole.yaml
+  recbole_use_gpu: true
+  adaptive_fusion: false
 
 rerank:
-  enabled: true
-  use_template: false  # 使用LLM重排序
-  use_reranker_model: true  # 使用Qwen3-Reranker-4B
-  qwen_reranker_path: models/Qwen3-Reranker-4B  # Reranker模型路径
-  rerank_topk: 20  # Reranker精排后的Top-K数量
+  enabled: ${GOAFAR_RERANK_ENABLED:true}
+  use_template: ${GOAFAR_RERANK_TEMPLATE:false}
+  use_reranker_model: ${GOAFAR_RERANK_MODEL:true}
+  qwen_reranker_path: ${GOAFAR_RERANK_PATH:models/Qwen3-Reranker-4B}
+  rerank_topk: 20
   topk: 30
 
 planner:
   matrix_provider: auto
-  osrm_url: http://router.project-osrm.org
+  osrm_url: ${GOAFAR_OSRM_URL:http://router.project-osrm.org}
   avg_speed_kmh: 55
   start_time_min: 480
   max_duration_hours: 10
@@ -70,21 +109,27 @@ planner:
   matrix_cache_ttl_hours: 24
 
 llm:
-  enabled: true  # 启用LLM功能
-  mode: qwen  # 使用Qwen模型
-  qwen_model: models/Qwen3-8B  # 主模型路径
-  qwen_embedding_path: models/Qwen3-Embedding-4B  # Embedding模型路径
-  qwen_reranker_path: models/Qwen3-Reranker-4B  # Reranker模型路径
-  use_lora: false  # 是否使用LoRA适配器
-  lora_path: null  # LoRA适配器路径
-  use_gpu: true
-  max_new_tokens: 512
-  temperature: 0.7
+  enabled: ${GOAFAR_LLM_ENABLED:true}
+  mode: qwen
+  qwen_model: ${GOAFAR_LLM_MODEL:models/Qwen3-8B}
+  qwen_embedding_path: models/Qwen3-Embedding-4B
+  qwen_reranker_path: models/Qwen3-Reranker-4B
+  use_lora: ${GOAFAR_LLM_LORA:false}
+  lora_path: ${GOAFAR_LLM_LORA_PATH:null}
+  use_gpu: ${GOAFAR_LLM_GPU:true}
+  max_new_tokens: ${GOAFAR_LLM_MAX_TOKENS:512}
+  temperature: ${GOAFAR_LLM_TEMPERATURE:0.7}
+  top_p: ${GOAFAR_LLM_TOP_P:0.9}
+  # 推理配置
+  inference_max_length: ${GOAFAR_LLM_INFERENCE_MAX_LENGTH:2048}
+  # 模型量化
+  load_in_8bit: ${GOAFAR_LLM_8BIT:false}
+  load_in_4bit: ${GOAFAR_LLM_4BIT:false}
 
 # SFT/DPO训练配置
 training:
   sft:
-    output_dir: outputs/sft/qwen3-8b-tourism
+    output_dir: outputs/sft/qween3-8b-tourism
     use_lora: true
     lora_r: 16
     lora_alpha: 16
@@ -101,7 +146,144 @@ training:
     beta: 0.1
     max_length: 256
 
+# MLflow实验追踪配置
+mlflow:
+  enabled: ${GOAFAR_MLFLOW_ENABLED:true}
+  backend: auto
+  tracking_uri: ${GOAFAR_MLFLOW_URI:null}
+  experiment_name: ${GOAFAR_MLFLOW_EXPERIMENT:null}
+  json_output_dir: outputs/experiments
+  artifact_location: mlflow-artifacts
+  auto_flush: true
+  tags:
+    project: goafar
+    version: "1.0"
+
+# GRPO训练配置
+grpo:
+  output_dir: outputs/grpo/qwen3-8b-planner
+  group_size: 4
+  kl_coef: 0.1
+  learning_rate: 1e-5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_train_epochs: 3
+  max_length: 2048
+  max_prompt_length: 512
+  max_new_tokens: 256
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 16
+  lora_dropout: 0.05
+
 fallback:
   allow_without_embeddings: true
   min_candidates_for_planning: 5
-  llm_to_template: true  # LLM失败时回退到模板
+  llm_to_template: true
+
+# =============================================================================
+# 健康检查配置
+# =============================================================================
+health:
+  # 健康检查端点
+  enabled: true
+  # 模型加载超时(秒)
+  model_load_timeout: 300
+  # 外部服务检查超时(秒)
+  service_check_timeout: 10
+  # 启用就绪探针的深度检查
+  readyz_deep_check: true
+
+# =============================================================================
+# 缓存配置
+# =============================================================================
+cache:
+  # 内存缓存配置
+  enabled: ${GOAFAR_CACHE_ENABLED:true}
+  # 嵌入向量缓存TTL(秒)
+  embedding_ttl: ${GOAFAR_CACHE_EMBEDDING_TTL:86400}
+  # 路径规划缓存TTL(秒)
+  routing_ttl: ${GOAFAR_CACHE_ROUTING_TTL:3600}
+  # 最大缓存条目数
+  max_items: ${GOAFAR_CACHE_MAX_ITEMS:10000}
+
+# =============================================================================
+# 监控配置
+# =============================================================================
+monitoring:
+  # Prometheus指标导出
+  prometheus:
+    enabled: ${GOAFAR_PROM_ENABLED:true}
+    port: ${GOAFAR_PROM_PORT:9090}
+    path: ${GOAFAR_PROM_PATH:/metrics}
+  # 分布式追踪
+  tracing:
+    enabled: ${GOAFAR_TRACING_ENABLED:false}
+    endpoint: ${GOAFAR_TRACING_ENDPOINT:null}
+    sample_rate: ${GOAFAR_TRACING_SAMPLE_RATE:0.1}
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  level: ${GOAFAR_LOG_LEVEL:INFO}
+  # 日志输出目录
+  log_dir: ${GOAFAR_LOG_DIR:logs}
+  # 日志文件大小限制(MB)
+  max_file_size_mb: ${GOAFAR_LOG_MAX_SIZE:10}
+  # 保留的日志文件数量
+  backup_count: ${GOAFAR_LOG_BACKUP_COUNT:5}
+  # 日志格式 (json, text)
+  format: ${GOAFAR_LOG_FORMAT:text}
+  # 敏感信息脱敏
+  sanitize_secrets: ${GOAFAR_LOG_SANITIZE:true}
+
+# =============================================================================
+# 环境特定配置覆盖
+# =============================================================================
+environments:
+  dev:
+    runtime:
+      log_level: DEBUG
+      profiling: true
+    api:
+      cors_origins: "*"
+      rate_limit_enabled: false
+    llm:
+      use_gpu: true
+      load_in_8bit: false
+
+  staging:
+    runtime:
+      log_level: INFO
+      workers: 2
+    api:
+      rate_limit_enabled: true
+      rate_limit_requests: 200
+    monitoring:
+      prometheus:
+        enabled: true
+      tracing:
+        enabled: true
+        sample_rate: 0.5
+
+  prod:
+    runtime:
+      log_level: WARNING
+      workers: 4
+      request_timeout: 120
+    api:
+      rate_limit_enabled: true
+      rate_limit_requests: 100
+      api_key_required: true
+    llm:
+      load_in_8bit: true
+      max_new_tokens: 256
+    logging:
+      format: json
+    monitoring:
+      prometheus:
+        enabled: true
+      tracing:
+        enabled: true
+        sample_rate: 0.1

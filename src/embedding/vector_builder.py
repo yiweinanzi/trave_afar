@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,8 +14,28 @@ import pandas as pd
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from embedding.bge_m3_encoder import BGEM3Encoder
-from utils.id_mapping import normalize_poi_id
+# Optional import for BGE-M3 (may not be available due to version conflicts)
+try:
+    try:
+        from src.embedding.bge_m3_encoder import BGEM3Encoder
+    except ImportError:
+        from embedding.bge_m3_encoder import BGEM3Encoder
+except (ImportError, Exception):
+    BGEM3Encoder = None
+
+# Optional import for Qwen3 embedding
+try:
+    try:
+        from src.embedding.qwen3_encoder import Qwen3Embedding
+    except ImportError:
+        from embedding.qwen3_encoder import Qwen3Embedding
+except (ImportError, Exception):
+    Qwen3Embedding = None
+
+try:
+    from src.utils.id_mapping import normalize_poi_id
+except ImportError:
+    from utils.id_mapping import normalize_poi_id
 
 try:
     import faiss  # type: ignore
@@ -25,6 +45,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BGE_MODEL = os.getenv("GOAFAR_BGE_MODEL", "models/Xorbits/bge-m3")
+DEFAULT_QWEN_MODEL = os.getenv("GOAFAR_QWEN3_EMBEDDING_MODEL", "models/Qwen3-Embedding-4B")
 
 
 def _resolve_path(path_like: str | Path) -> Path:
@@ -45,6 +66,71 @@ def _resolve_model_path(model_path: str | None) -> str:
     if candidate.exists():
         return str(candidate)
     return DEFAULT_BGE_MODEL
+
+
+def _resolve_qwen_model_path(model_path: str | None) -> str:
+    if model_path:
+        candidate = _resolve_path(model_path)
+        if candidate.exists() and "qwen" in candidate.name.lower():
+            return str(candidate)
+        if "qwen" in str(model_path).lower():
+            return model_path
+
+    candidate = _resolve_path(DEFAULT_QWEN_MODEL)
+    if candidate.exists():
+        return str(candidate)
+    return DEFAULT_QWEN_MODEL
+
+
+def _looks_like_qwen_model(model_path: str | None) -> bool:
+    if not model_path:
+        return False
+    return "qwen" in str(model_path).lower()
+
+
+def _create_encoder(model_path: str | None, use_gpu: bool) -> tuple[Any, str, str]:
+    """
+    创建可用的 embedding encoder，优先遵循 model_path 指向。
+    返回: (encoder, resolved_model_path, backend_name)
+    """
+    errors: list[str] = []
+    prefer_qwen = _looks_like_qwen_model(model_path)
+
+    # 1) 优先尝试 Qwen（当显式配置了 qwen 路径时）
+    if prefer_qwen and Qwen3Embedding is not None:
+        qwen_model = _resolve_qwen_model_path(model_path)
+        try:
+            encoder = Qwen3Embedding(model_path=qwen_model, use_gpu=use_gpu)
+            if hasattr(encoder, "is_available") and not encoder.is_available():
+                raise RuntimeError(f"Qwen3Embedding 不可用: {qwen_model}")
+            return encoder, qwen_model, "qwen3"
+        except Exception as exc:
+            errors.append(f"Qwen3 初始化失败: {exc}")
+
+    # 2) 尝试 BGE-M3
+    if BGEM3Encoder is not None:
+        bge_model = _resolve_model_path(model_path if not prefer_qwen else None)
+        try:
+            return BGEM3Encoder(model_path=bge_model, use_gpu=use_gpu), bge_model, "bge-m3"
+        except Exception as exc:
+            errors.append(f"BGE-M3 初始化失败: {exc}")
+    else:
+        errors.append("BGE-M3 不可用（FlagEmbedding 导入失败）")
+
+    # 3) 最后回退 Qwen（即使 model_path 没显式写 qwen，也可作为后备）
+    if Qwen3Embedding is not None:
+        qwen_model = _resolve_qwen_model_path(model_path)
+        try:
+            encoder = Qwen3Embedding(model_path=qwen_model, use_gpu=use_gpu)
+            if hasattr(encoder, "is_available") and not encoder.is_available():
+                raise RuntimeError(f"Qwen3Embedding 不可用: {qwen_model}")
+            return encoder, qwen_model, "qwen3"
+        except Exception as exc:
+            errors.append(f"Qwen3 回退失败: {exc}")
+    else:
+        errors.append("Qwen3Embedding 不可用")
+
+    raise RuntimeError("无法初始化任何 embedding 模型；" + "；".join(errors))
 
 
 def _build_poi_texts(df: pd.DataFrame) -> list[str]:
@@ -148,10 +234,10 @@ def build_faiss_index(
 
 
 def build_poi_embeddings(
-    poi_csv: str = "data/poi.csv",
+    poi_csv: str = "data/all/poi_with_coords.csv",
     output_dir: str = "outputs/emb",
     model_path: str | None = None,
-    use_gpu: bool = False,
+    use_gpu: bool = True,
     build_faiss: bool = True,
     faiss_index_file: str = "outputs/emb/poi_faiss.index",
 ):
@@ -162,16 +248,15 @@ def build_poi_embeddings(
     output_path.mkdir(parents=True, exist_ok=True)
 
     poi_path = _resolve_path(poi_csv)
-    df = pd.read_csv(poi_path)
+    df = pd.read_csv(poi_path, low_memory=False)
     if "poi_id" in df.columns:
         df["poi_id"] = df["poi_id"].apply(normalize_poi_id)
 
     print(f"✓ 加载 {len(df)} 个 POI")
     texts = _build_poi_texts(df)
 
-    resolved_model = _resolve_model_path(model_path)
-    print(f"初始化 BGE-M3 编码器: {resolved_model}")
-    encoder = BGEM3Encoder(model_path=resolved_model, use_gpu=use_gpu)
+    encoder, resolved_model, backend_name = _create_encoder(model_path=model_path, use_gpu=use_gpu)
+    print(f"初始化语义编码器[{backend_name}]: {resolved_model}")
 
     embeddings_dict = encoder.encode_texts(
         texts,
@@ -204,10 +289,10 @@ def build_poi_embeddings(
 def ensure_embedding_artifacts(
     emb_file: str = "outputs/emb/poi_emb.npy",
     meta_file: str = "outputs/emb/poi_meta.csv",
-    poi_csv: str = "data/poi.csv",
+    poi_csv: str = "data/all/poi_with_coords.csv",
     output_dir: str = "outputs/emb",
     model_path: str | None = None,
-    use_gpu: bool = False,
+    use_gpu: bool = True,
     auto_build: bool = True,
     build_faiss: bool = True,
     faiss_index_file: str = "outputs/emb/poi_faiss.index",
@@ -217,13 +302,44 @@ def ensure_embedding_artifacts(
     """
     emb_path = _resolve_path(emb_file)
     meta_path = _resolve_path(meta_file)
-    if emb_path.exists() and meta_path.exists():
+    poi_path = _resolve_path(poi_csv)
+
+    def _artifacts_match_source() -> tuple[bool, str]:
+        if not emb_path.exists() or not meta_path.exists():
+            return False, "artifact_missing"
+        if not poi_path.exists():
+            # 无法校验源数据时，仅要求产物存在
+            return True, "source_missing_skip_check"
+
+        try:
+            meta_df = pd.read_csv(meta_path, usecols=["poi_id"], low_memory=False)
+            poi_df = pd.read_csv(poi_path, usecols=["poi_id"], low_memory=False)
+
+            meta_ids = set(meta_df["poi_id"].astype(str).map(normalize_poi_id))
+            poi_ids = set(poi_df["poi_id"].astype(str).map(normalize_poi_id))
+
+            if meta_ids != poi_ids:
+                missing = len(poi_ids - meta_ids)
+                extra = len(meta_ids - poi_ids)
+                return False, f"id_mismatch(missing={missing},extra={extra})"
+
+            emb_rows = int(np.load(emb_path, mmap_mode="r").shape[0])
+            if emb_rows != len(meta_df):
+                return False, f"row_mismatch(emb={emb_rows},meta={len(meta_df)})"
+
+            return True, "ok"
+        except Exception as exc:
+            return False, f"validation_error:{exc}"
+
+    matched, reason = _artifacts_match_source()
+    if matched:
         return True
 
     if not auto_build:
+        print(f"⚠️ 向量产物不可用或不一致({reason})，且 auto_build=False")
         return False
 
-    print("⚠️ 检测到向量产物缺失，正在自动构建...")
+    print(f"⚠️ 检测到向量产物缺失/不一致({reason})，正在自动构建...")
     build_poi_embeddings(
         poi_csv=poi_csv,
         output_dir=output_dir,
@@ -232,7 +348,8 @@ def ensure_embedding_artifacts(
         build_faiss=build_faiss,
         faiss_index_file=faiss_index_file,
     )
-    return emb_path.exists() and meta_path.exists()
+    matched, _ = _artifacts_match_source()
+    return matched
 
 
 def _search_numpy(embeddings: np.ndarray, query_vec: np.ndarray, topk: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -265,11 +382,11 @@ def search_similar_pois(
     emb_file: str = "outputs/emb/poi_emb.npy",
     meta_file: str = "outputs/emb/poi_meta.csv",
     model_path: str | None = None,
-    use_gpu: bool = False,
+    use_gpu: bool = True,
     backend: str = "auto",
     faiss_index_file: str = "outputs/emb/poi_faiss.index",
     auto_build: bool = False,
-    poi_csv: str = "data/poi.csv",
+    poi_csv: str = "data/all/poi_with_coords.csv",
 ):
     """
     Search similar POIs by dense embedding.
@@ -297,14 +414,14 @@ def search_similar_pois(
     emb_path = _resolve_path(emb_file)
     meta_path = _resolve_path(meta_file)
     embeddings = np.load(emb_path).astype("float32")
-    metadata = pd.read_csv(meta_path)
+    metadata = pd.read_csv(meta_path, low_memory=False)
     if "poi_id" in metadata.columns:
         metadata["poi_id"] = metadata["poi_id"].apply(normalize_poi_id)
 
     topk = max(1, min(topk, len(metadata)))
 
-    resolved_model = _resolve_model_path(model_path)
-    encoder = BGEM3Encoder(model_path=resolved_model, use_gpu=use_gpu)
+    encoder, resolved_model, backend_name = _create_encoder(model_path=model_path, use_gpu=use_gpu)
+    print(f"语义检索使用编码器[{backend_name}]: {resolved_model}")
     query_emb = encoder.encode_query(query_text, return_dense=True)
     query_vec = query_emb["dense_vec"].astype("float32")
 

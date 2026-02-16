@@ -3,6 +3,10 @@ DPO训练脚本
 使用TRL的DPOTrainer对文案生成模型进行偏好对齐训练
 
 参考: open_resource/trl-main/examples/scripts/dpo.py
+
+实验追踪：
+- 支持MLflow自动追踪训练参数和指标
+- 自动记录模型和训练配置
 """
 import os
 import sys
@@ -10,10 +14,23 @@ import json
 import pandas as pd
 import torch
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # 添加src到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 导入实验追踪模块
+try:
+    from src.utils.experiment import (
+        MLflowExperiment,
+        ExperimentConfig,
+        ExperimentManager,
+        MLflowCallback,
+    )
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: MLflow tracking not available. Install with: pip install mlflow")
 
 from datasets import Dataset, load_dataset
 from transformers import (
@@ -22,7 +39,7 @@ from transformers import (
     TrainingArguments,
     BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from trl import DPOTrainer, DPOConfig
 
 
@@ -41,7 +58,7 @@ def _resolve_qwen_model_path() -> str:
     for path in candidates:
         if path.exists():
             return str(path)
-    return "Qwen/Qwen3-8B"
+    return str(MODEL_CACHE_DIR / "Qwen3-8B")
 
 def prepare_preference_data(prefs_csv: str = 'outputs/datasets/dpo_prefs.csv') -> Dataset:
     """
@@ -99,7 +116,11 @@ def train_dpo(
     beta: float = 0.1,
     max_length: int = 512,
     max_prompt_length: int = 256,
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    # 实验追踪参数
+    use_mlflow: bool = True,
+    mlflow_tracking_uri: Optional[str] = None,
+    mlflow_experiment_name: str = "dpo_tourism",
 ) -> DPOTrainer:
     """
     训练DPO模型
@@ -121,6 +142,9 @@ def train_dpo(
         max_length: 最大序列长度
         max_prompt_length: 最大prompt长度
         use_gpu: 是否使用GPU
+        use_mlflow: 是否启用MLflow实验追踪
+        mlflow_tracking_uri: MLflow服务器地址
+        mlflow_experiment_name: MLflow实验名称
 
     Returns:
         DPOTrainer: 训练好的训练器
@@ -128,6 +152,23 @@ def train_dpo(
     print("="*80)
     print("DPO训练 - GoAfar推荐系统偏好对齐")
     print("="*80)
+
+    # 初始化实验追踪
+    experiment_tracker = None
+    if use_mlflow and MLFLOW_AVAILABLE:
+        print(f"初始化MLflow实验追踪: {mlflow_experiment_name}")
+        config = ExperimentConfig(
+            enabled=True,
+            tracking_uri=mlflow_tracking_uri,
+            tags={"task": "dpo", "model": "Qwen3-8B"},
+        )
+        manager = ExperimentManager(
+            mlflow_tracking_uri=mlflow_tracking_uri,
+            config=config,
+        )
+        experiment_tracker = manager.create_experiment(mlflow_experiment_name)
+        if hasattr(experiment_tracker, 'start_run'):
+            experiment_tracker.start_run()
 
     # 检查GPU
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
@@ -144,6 +185,17 @@ def train_dpo(
     # 准备数据
     print(f"\n加载数据集: {prefs_csv}")
     dataset = prepare_preference_data(prefs_csv)
+
+    # 记录数据集信息
+    if experiment_tracker:
+        dataset_info = {
+            "prefs_csv": prefs_csv,
+            "num_samples": len(dataset),
+            "max_length": max_length,
+            "max_prompt_length": max_prompt_length,
+            "beta": beta,
+        }
+        experiment_tracker.log_dataset(dataset_info)
 
     # QLoRA配置 (4-bit量化)
     bnb_config = None
@@ -168,6 +220,28 @@ def train_dpo(
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # 记录训练参数
+    if experiment_tracker:
+        params = {
+            "model_name": model_name,
+            "prefs_csv": prefs_csv,
+            "output_dir": output_dir,
+            "use_lora": use_lora,
+            "use_qlora": use_qlora,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "learning_rate": learning_rate,
+            "num_train_epochs": num_train_epochs,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "beta": beta,
+            "max_length": max_length,
+            "max_prompt_length": max_prompt_length,
+            "device": device,
+        }
+        experiment_tracker.log_params(params)
 
     # 加载模型
     print(f"\n加载模型: {model_name}")
@@ -206,18 +280,11 @@ def train_dpo(
             task_type="CAUSAL_LM"
         )
 
-        if use_qlora:
+        if use_qlora and bnb_config is not None:
             # QLoRA模式: 准备模型用于量化训练
             model = prepare_model_for_kbit_training(model)
-            model = get_peft_model(model, peft_config)
-            model.print_trainable_parameters()
-            # QLoRA模式下不需要显式参考模型
-            ref_model = None
-        else:
-            # 标准LoRA模式: 不需要参考模型，DPOTrainer会自动处理
-            model = get_peft_model(model, peft_config)
-            model.print_trainable_parameters()
-            ref_model = None
+        # LoRA适配器由DPOTrainer根据peft_config注入
+        ref_model = None
     else:
         # 全量微调模式: 需要参考模型
         print("\n全量微调模式 (加载参考模型...)")
@@ -263,11 +330,8 @@ def train_dpo(
         ref_model=ref_model,
         args=dpo_config,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         peft_config=peft_config,
-        beta=beta,
-        max_length=max_length,
-        max_prompt_length=max_prompt_length
     )
 
     # 训练
@@ -298,6 +362,30 @@ def train_dpo(
     config_path = Path(output_dir) / "training_config.json"
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+
+    # 记录最终指标和模型
+    if experiment_tracker:
+        # 记录训练日志中的最终指标
+        if hasattr(trainer.state, 'log_history') and trainer.state.log_history:
+            final_metrics = {}
+            for log in trainer.state.log_history[-5:]:  # 最后几条日志
+                for k, v in log.items():
+                    if isinstance(v, (int, float)) and k != 'epoch':
+                        final_metrics[f'final_{k}'] = v
+            experiment_tracker.log_metrics(final_metrics)
+
+        # 记录模型
+        experiment_tracker.log_model(
+            output_dir,
+            name="dpo_model",
+            model_type="huggingface"
+        )
+
+        # 记录训练配置
+        experiment_tracker.log_artifact(str(config_path))
+
+        # 结束实验
+        experiment_tracker.finish(status="FINISHED")
 
     print("\n" + "="*80)
     print("✅ DPO训练完成！")

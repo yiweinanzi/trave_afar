@@ -114,7 +114,7 @@ def estimate_stay_time(name, desc):
     else:
         return 150
 
-def parse_go_address_sql(sql_file='sql/go_address.sql', output_csv='data/poi.csv'):
+def parse_go_address_sql(sql_file='sql/go_address.sql', output_csv='data/all/poi_expanded.csv'):
     """解析 go_address.sql 文件，提取所有省份数据"""
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()

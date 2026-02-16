@@ -60,7 +60,19 @@ WebAIBackend-master/
 # 数据文件（大，不上传）
 data/
 outputs/
+sql/
+.gradio/
 
-# 保留以下文档文件
-!data/DATA_*.md
-!outputs/简历-*.md
+# Docker
+docker-compose.override.yml
+
+# Environment
+.env
+.env.local
+
+# MLflow
+mlruns/
+
+# Prometheus/Grafana data
+prometheus-data/
+grafana-data/

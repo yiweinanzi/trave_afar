@@ -14,12 +14,19 @@ import pandas as pd
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from embedding.vector_builder import search_similar_pois
-from utils.id_mapping import normalize_poi_id
+try:
+    from src.embedding.vector_builder import search_similar_pois
+    from src.utils.id_mapping import normalize_poi_id
+except ImportError:
+    from embedding.vector_builder import search_similar_pois
+    from utils.id_mapping import normalize_poi_id
 
 # 导入 RecBole Provider
 try:
-    from recommendation.recbole_trainer import RecBoleProvider
+    try:
+        from src.recommendation.recbole_trainer import RecBoleProvider
+    except ImportError:
+        from recommendation.recbole_trainer import RecBoleProvider
     RECOBOLE_AVAILABLE = True
 except ImportError:
     RECOBOLE_AVAILABLE = False
@@ -150,14 +157,22 @@ def adaptive_fusion(
 
 
 def _prepare_poi_df(poi_csv: str) -> pd.DataFrame:
-    poi = pd.read_csv(_resolve_path(poi_csv))
+    poi = pd.read_csv(_resolve_path(poi_csv), low_memory=False)
     poi["poi_id"] = poi["poi_id"].apply(normalize_poi_id)
+    if {"lat", "lon"}.issubset(poi.columns):
+        poi["lat"] = pd.to_numeric(poi["lat"], errors="coerce")
+        poi["lon"] = pd.to_numeric(poi["lon"], errors="coerce")
+        valid_coord = poi["lat"].notna() & poi["lon"].notna()
+        dropped = int((~valid_coord).sum())
+        if dropped > 0:
+            print(f"⚠️ 过滤 {dropped} 条无坐标 POI，仅保留可规划候选")
+        poi = poi.loc[valid_coord].reset_index(drop=True)
     return poi
 
 
 def _behavior_recall(
     poi_df: pd.DataFrame,
-    user_events_csv: str = "data/user_events.csv",
+    user_events_csv: str = "data/all/user_events.csv",
     user_id: Optional[str] = None,
     topk: int = 30,
     use_recbole: bool = False,
@@ -216,7 +231,7 @@ def _behavior_recall(
     if not path.exists():
         return pd.DataFrame(columns=list(poi_df.columns) + ["behavior_score"])
 
-    events = pd.read_csv(path)
+    events = pd.read_csv(path, low_memory=False)
     if len(events) == 0:
         return pd.DataFrame(columns=list(poi_df.columns) + ["behavior_score"])
 
@@ -253,7 +268,7 @@ def _geo_recall(
     poi_df: pd.DataFrame,
     province_filter: Optional[str],
     topk: int = 40,
-    user_events_csv: str = "data/user_events.csv",
+    user_events_csv: str = "data/all/user_events.csv",
 ) -> pd.DataFrame:
     scoped = poi_df
     if province_filter:
@@ -297,12 +312,12 @@ def merge_candidates(
     topk_seq: int = 30,
     topk_geo: int = 30,
     province_filter: Optional[str] = None,
-    poi_csv: str = "data/poi.csv",
-    user_events_csv: str = "data/user_events.csv",
+    poi_csv: str = "data/all/poi_with_coords.csv",
+    user_events_csv: str = "data/all/user_events.csv",
     emb_file: str = "outputs/emb/poi_emb.npy",
     meta_file: str = "outputs/emb/poi_meta.csv",
     model_path: Optional[str] = None,
-    use_gpu: bool = False,
+    use_gpu: bool = True,
     backend: str = "auto",
     allow_without_embeddings: bool = True,
     fusion: str = "rrf",
@@ -437,9 +452,12 @@ def merge_candidates(
         how="left",
     )
 
-    merged["semantic_score"] = merged["semantic_score"].fillna(0.0)
-    merged["behavior_score"] = merged["behavior_score"].fillna(0.0)
-    merged["geo_score"] = merged["geo_score"].fillna(0.0)
+    for score_col in ("semantic_score", "behavior_score", "geo_score"):
+        merged[score_col] = (
+            pd.to_numeric(merged[score_col], errors="coerce")
+            .fillna(0.0)
+            .astype(float)
+        )
 
     merged["from_dense"] = merged["semantic_score"] > 0
     merged["from_behavior"] = merged["behavior_score"] > 0
@@ -483,7 +501,7 @@ def merge_candidates(
     print(f"  地理召回: {len(geo)}")
     print(f"  融合候选: {len(merged)}")
 
-    # 添加融合权重信息到返���结果（用于调试）
+    # 添加融合权重信息到返回结果（用于调试）
     merged.attrs['fusion_weights'] = {
         'dense': actual_dense_weight,
         'behavior': actual_behavior_weight,

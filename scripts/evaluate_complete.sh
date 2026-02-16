@@ -6,9 +6,26 @@
 
 set -e
 
-# 激活环境
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate goafar
+# 项目根目录
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# 可选激活 conda 环境（失败时回退到当前环境）
+TARGET_CONDA_ENV="${GOAFAR_CONDA_ENV:-goafar}"
+if command -v conda >/dev/null 2>&1; then
+    CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+    if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+        # shellcheck disable=SC1090
+        source "$CONDA_BASE/etc/profile.d/conda.sh"
+        if ! conda activate "$TARGET_CONDA_ENV" >/dev/null 2>&1; then
+            echo "Warning: failed to activate conda env '$TARGET_CONDA_ENV', using current env."
+        fi
+    else
+        echo "Warning: unable to locate conda.sh, using current env."
+    fi
+else
+    echo "Warning: conda not found, using current env."
+fi
 
 # 默认参数
 USE_LLM=false
@@ -94,7 +111,7 @@ if [ -n "$QUERIES_FILE" ]; then
     PIPELINE_ARGS="$PIPELINE_ARGS --queries $QUERIES_FILE"
 fi
 
-python src/evaluation/evaluate_pipeline.py $PIPELINE_ARGS \
+python -m src.evaluation.evaluate_pipeline $PIPELINE_ARGS \
     2>&1 | tee "$OUTPUT_DIR/pipeline_eval.log"
 
 # 2. 推荐质量指标评测

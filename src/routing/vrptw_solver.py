@@ -21,16 +21,53 @@ class VRPTWSolver:
             time_matrix: 时间矩阵（秒）
             start_time_min: 出发时间（从午夜开始的分钟数，默认8:00）
         """
-        self.poi_df = poi_df
-        self.time_matrix = time_matrix
+        self.poi_df = poi_df.copy()
+        # 清洗时间相关字段，避免 NaN/非法值导致整数转换失败
+        for col, default in (("stay_min", 60), ("open_min", 0), ("close_min", 24 * 60)):
+            if col not in self.poi_df.columns:
+                self.poi_df[col] = default
+            self.poi_df[col] = pd.to_numeric(self.poi_df[col], errors="coerce").fillna(default)
+
+        self.poi_df["stay_min"] = self.poi_df["stay_min"].clip(lower=0)
+        self.poi_df["open_min"] = self.poi_df["open_min"].clip(lower=0, upper=24 * 60)
+        self.poi_df["close_min"] = self.poi_df["close_min"].clip(lower=0, upper=24 * 60)
+        invalid_window = self.poi_df["close_min"] <= self.poi_df["open_min"]
+        if invalid_window.any():
+            self.poi_df.loc[invalid_window, "open_min"] = 0
+            self.poi_df.loc[invalid_window, "close_min"] = 24 * 60
+
+        self.num_locations = len(self.poi_df)
+        self.time_matrix = self._sanitize_time_matrix(time_matrix)
         self.start_time_min = start_time_min
-        self.num_locations = len(poi_df)
         
         print(f"初始化 VRPTW 求解器:")
         print(f"  POI数量: {self.num_locations}")
         print(f"  出发时间: {start_time_min//60:02d}:{start_time_min%60:02d}")
+
+    def _sanitize_time_matrix(self, time_matrix):
+        """清洗时间矩阵，避免 NaN/Inf 导致后续整数转换失败。"""
+        matrix = np.asarray(time_matrix, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError(f"time_matrix 必须是方阵，当前 shape={matrix.shape}")
+        if matrix.shape[0] != self.num_locations:
+            raise ValueError(
+                f"time_matrix 大小与 POI 数不一致: matrix={matrix.shape[0]}, pois={self.num_locations}"
+            )
+
+        finite_mask = np.isfinite(matrix)
+        if not finite_mask.all():
+            finite_values = matrix[finite_mask]
+            fallback = float(np.nanmedian(finite_values)) if finite_values.size else 3600.0
+            if not np.isfinite(fallback) or fallback <= 0:
+                fallback = 3600.0
+            matrix = np.where(finite_mask, matrix, fallback)
+            print(f"  ⚠️ 时间矩阵含缺失值，已用 {int(fallback)} 秒填充")
+
+        matrix = np.clip(matrix, 0, None)
+        np.fill_diagonal(matrix, 0.0)
+        return np.rint(matrix).astype(np.int64)
     
-    def solve(self, depot_index=0, max_duration_hours=10, 
+    def solve(self, depot_index=0, max_duration_hours=10,
               num_vehicles=1, time_limit_seconds=30):
         """
         求解VRPTW问题
@@ -77,7 +114,7 @@ class VRPTWSolver:
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
         
         # 添加时间维度约束
-        horizon = max_duration_hours * 3600  # 转换为秒
+        horizon = int(max(1, round(float(max_duration_hours) * 3600)))  # 转换为秒
         routing.AddDimension(
             transit_callback_index,
             3600,          # 最大等待时间（1小时）
@@ -96,17 +133,17 @@ class VRPTWSolver:
             close_time = int(self.poi_df.iloc[i]['close_min'] * 60)
             
             # 转换为相对于出发时间的时间
-            start_time_sec = self.start_time_min * 60
+            start_time_sec = int(self.start_time_min * 60)
             open_relative = max(0, open_time - start_time_sec)
             close_relative = close_time - start_time_sec
             
             # 全天开放的景点（如道路、市区）
             if close_time >= 1440 * 60:
-                time_dimension.CumulVar(index).SetRange(0, horizon)
+                time_dimension.CumulVar(index).SetRange(0, int(horizon))
             else:
                 # 确保时间窗口在合理范围内
                 open_relative = max(0, open_relative)
-                close_relative = min(horizon, close_relative)
+                close_relative = min(int(horizon), close_relative)
                 
                 if open_relative < close_relative:
                     time_dimension.CumulVar(index).SetRange(
@@ -115,7 +152,7 @@ class VRPTWSolver:
                     )
                 else:
                     # 如果时间窗口无效，设置为全天
-                    time_dimension.CumulVar(index).SetRange(0, horizon)
+                    time_dimension.CumulVar(index).SetRange(0, int(horizon))
         
         # 允许跳过POI（如果时间窗不可达）
         penalty = 1000000  # 大罚分
@@ -131,7 +168,7 @@ class VRPTWSolver:
         search_parameters.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         )
-        search_parameters.time_limit.FromSeconds(time_limit_seconds)
+        search_parameters.time_limit.FromSeconds(int(max(1, time_limit_seconds)))
         
         # 求解
         print(f"正在求解（时间限制: {time_limit_seconds}秒）...")
@@ -228,7 +265,7 @@ if __name__ == "__main__":
     print("="*60)
     
     # 加载数据
-    poi_df = pd.read_csv('data/poi.csv').head(20)  # 测试用前20个
+    poi_df = pd.read_csv('data/all/poi_expanded.csv').head(20)  # 测试用前20个
     
     # 构建时间矩阵
     time_matrix, poi_df = build_time_matrix(poi_ids=poi_df['poi_id'].tolist())
@@ -242,4 +279,3 @@ if __name__ == "__main__":
         with open('outputs/routing/test_result.json', 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"\n✓ 结果保存到: outputs/routing/test_result.json")
-

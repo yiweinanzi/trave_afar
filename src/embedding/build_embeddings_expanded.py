@@ -42,7 +42,7 @@ class EmbeddingConfig:
 
     # Model
     model_path: str = "models/Qwen3-Embedding-4B"
-    fallback_model_path: str = "models/Xorbits/bge-m3"
+    fallback_model_path: str = "models/Qwen3-Embedding-4B"
 
     # Processing
     batch_size: int = 256  # GPU can handle larger batches
